@@ -13,11 +13,22 @@
  * Auto-enable (ON by default): every session writes a live file to the
  * default vault directory (DEFAULT_LIVE_DIR below) with an auto-generated
  * name Pi-Live-<project>-<timestamp>.md. Parallel agents never share a file.
- * Environment overrides:
+ *
+ * Machine-local configuration (optional): ~/.pi/agent/oblive.json
+ *   {
+ *     "liveDir": "/path/to/vault/Notes",   // default directory
+ *     "livePath": "/path/to/file.md",      // exact default file
+ *     "turns": 3,                          // default window size
+ *     "autoEnable": false                  // disable auto-enable
+ *   }
+ *
+ * Environment overrides (per launch, highest priority):
  *   OBLIVE_OFF=1         Disable auto-enable entirely
  *   OBLIVE_PATH=<file>   Enable at this exact path instead of the default dir
  *   OBLIVE_DIR=<dir>     Enable in this directory with an auto-generated name
- *   OBLIVE_TURNS=<n>     Initial turn window (default 1)
+ *   OBLIVE_TURNS=<n>     Initial turn window
+ *
+ * Priority: env vars > config file > built-in default.
  *
  * Every written file starts with a uniform YAML frontmatter block for
  * Obsidian indexing (type, project, session, model, turns, created,
@@ -42,8 +53,9 @@
  * transform, or summarize any content.
  */
 
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -422,6 +434,64 @@ function readTurnCountEnv(): number | null {
   return Number.isFinite(n) && n >= 1 ? n : null;
 }
 
+// ---------------------------------------------------------------------------
+// Machine-local configuration file (~/.pi/agent/oblive.json)
+// ---------------------------------------------------------------------------
+
+interface ObliveConfig {
+  liveDir?: string;
+  livePath?: string;
+  turns?: number;
+  autoEnable?: boolean;
+}
+
+/**
+ * Load the optional local config file. Missing file -> empty config.
+ * Malformed file or invalid fields -> ignored with a one-time warning.
+ */
+function loadConfig(ctx: ExtensionContext): ObliveConfig {
+  const file = join(getAgentDir(), "oblive.json");
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      ctx.ui.notify(
+        `Obsidian Live: cannot read ${file}: ${(error as Error).message}`,
+        "error",
+      );
+    }
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const cfg: ObliveConfig = {};
+    if (typeof parsed.liveDir === "string" && parsed.liveDir.trim() !== "") {
+      cfg.liveDir = parsed.liveDir;
+    }
+    if (typeof parsed.livePath === "string" && parsed.livePath.trim() !== "") {
+      cfg.livePath = parsed.livePath;
+    }
+    if (
+      typeof parsed.turns === "number" &&
+      Number.isInteger(parsed.turns) &&
+      parsed.turns >= 1
+    ) {
+      cfg.turns = parsed.turns;
+    }
+    if (typeof parsed.autoEnable === "boolean") {
+      cfg.autoEnable = parsed.autoEnable;
+    }
+    return cfg;
+  } catch (error) {
+    ctx.ui.notify(
+      `Obsidian Live: invalid JSON in ${file} - using defaults`,
+      "error",
+    );
+    return {};
+  }
+}
+
 /**
  * Atomic write: write to a temp file in the same directory, then rename.
  * Obsidian never sees a half-written file.
@@ -471,20 +541,24 @@ function notifyWriteError(ctx: ExtensionContext, message: string): void {
 
 export default function (pi: ExtensionAPI) {
   // --- auto-enable (ON by default; multi-agent friendly) ------------------
-  // Every session writes to DEFAULT_LIVE_DIR unless overridden or disabled.
-  // OBLIVE_PATH=<file>  exact target file
-  // OBLIVE_DIR=<dir>    auto-generated file name inside this dir
-  // OBLIVE_TURNS=<n>    initial turn window (default 1)
-  // OBLIVE_OFF=1        disable auto-enable
+  // Target resolution: OBLIVE_PATH > OBLIVE_DIR (env) > config livePath /
+  // liveDir (~/.pi/agent/oblive.json) > DEFAULT_LIVE_DIR. OBLIVE_OFF=1 or
+  // config autoEnable:false disables auto-enable.
   pi.on("session_start", async (_event, ctx) => {
     if (enabled) return;
+    const cfg = loadConfig(ctx);
     if (process.env.OBLIVE_OFF?.trim() === "1") return;
+    if (cfg.autoEnable === false) return;
     const pathEnv = process.env.OBLIVE_PATH?.trim();
     const dirEnv = process.env.OBLIVE_DIR?.trim();
     const target = pathEnv
       ? resolvePath(pathEnv)
-      : nextAvailableAutoPath(dirEnv ?? DEFAULT_LIVE_DIR, ctx.cwd);
-    const n = readTurnCountEnv();
+      : dirEnv
+        ? nextAvailableAutoPath(dirEnv, ctx.cwd)
+        : cfg.livePath
+          ? resolvePath(cfg.livePath)
+          : nextAvailableAutoPath(cfg.liveDir ?? DEFAULT_LIVE_DIR, ctx.cwd);
+    const n = readTurnCountEnv() ?? cfg.turns ?? null;
     if (n !== null) turnCount = n;
     createdAt = localIso();
     enabled = true;

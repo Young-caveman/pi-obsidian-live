@@ -42,7 +42,7 @@ cp obsidian-live.ts ~/.pi/agent/extensions/obsidian-live.ts
 
 ### 自动启用（默认开启）
 
-每次会话启动自动启用，默认写入 `DEFAULT_LIVE_DIR`（见 `obsidian-live.ts` 顶部常量，按需修改），文件名自动生成：
+每次会话启动自动启用，默认写入 `DEFAULT_LIVE_DIR`（见 `obsidian-live.ts` 顶部常量），文件名自动生成：
 
 ```text
 Pi-Live-<项目目录名>-<时间戳>.md
@@ -50,22 +50,46 @@ Pi-Live-<项目目录名>-<时间戳>.md
 
 并行运行多个 agent 时互不冲突（同一秒启动自动加 `-2` 后缀）。
 
-环境变量控制：
+### 本机配置（推荐）
+
+扩展会在会话启动时读取可选的本机配置文件 `~/.pi/agent/oblive.json`（不进仓库）：
+
+```json
+{
+  "liveDir": "/path/to/vault/Notes",
+  "livePath": "/path/to/exact-file.md",
+  "turns": 3,
+  "autoEnable": false
+}
+```
+
+| 字段 | 作用 |
+|---|---|
+| `liveDir` | 自动命名文件的默认目录 |
+| `livePath` | 默认精确目标文件 |
+| `turns` | 默认窗口大小 |
+| `autoEnable` | `false` 时完全关闭自动启用 |
+
+缺失文件、JSON 损坏或字段非法时优雅降级（通知后使用默认值），不会报错崩溃。
+
+### 环境变量（单次启动覆盖，优先级最高）
 
 | 变量 | 作用 |
 |---|---|
-| `OBLIVE_OFF=1` | 完全关闭自动启用 |
-| `OBLIVE_PATH=<文件>` | 指定精确目标文件 |
-| `OBLIVE_DIR=<目录>` | 换一个目录（自动命名） |
-| `OBLIVE_TURNS=<n>` | 初始窗口大小（默认 1） |
+| `OBLIVE_OFF=1` | 本次启动完全关闭自动启用 |
+| `OBLIVE_PATH=<文件>` | 本次指定精确目标文件 |
+| `OBLIVE_DIR=<目录>` | 本次换一个目录（自动命名） |
+| `OBLIVE_TURNS=<n>` | 本次初始窗口大小 |
+
+优先级：环境变量 > 配置文件 > 内置默认。
 
 示例：
 
 ```bash
-OBLIVE_DIR=~/Documents/Obsidian/Pi-Live pi          # 换目录
-OBLIVE_PATH=~/vault/backend.md pi                   # 精确文件
-OBLIVE_OFF=1 pi                                     # 关掉
-OBLIVE_TURNS=3 pi                                   # 显示最近 3 轮
+OBLIVE_DIR=~/Documents/Obsidian/Pi-Live pi          # 临时换目录
+OBLIVE_PATH=~/vault/backend.md pi                   # 临时精确文件
+OBLIVE_OFF=1 pi                                     # 临时关掉
+OBLIVE_TURNS=3 pi                                   # 临时显示最近 3 轮
 ```
 
 ## 文件格式
@@ -129,7 +153,7 @@ tags:
 - **流式捕获**：`before_agent_start` 拿用户 prompt；`message_start` / `message_update` / `message_end` 拿 assistant 流式内容（text / thinking / toolCall 块按序重建）
 - **历史重建**：`ctx.sessionManager.getBranch()` 只走当前活跃分支（root → leaf），天然排除被放弃的兄弟分支
 - **写入策略**：流式期间约 300ms 去抖 + 临时文件 rename 原子替换（Obsidian 不会读到半截文件）
-- **配置不持久化**：V1 全部在内存里，重启后按环境变量/命令重新启用
+- **配置**：本机配置 `~/.pi/agent/oblive.json` + 环境变量覆盖 + `/oblive` 命令；全部内存态，重启后自动按配置重新启用
 
 ## 许可
 
