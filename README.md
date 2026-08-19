@@ -59,7 +59,8 @@ Pi-Live-<项目目录名>-<时间戳>.md
   "liveDir": "/path/to/vault/Notes",
   "livePath": "/path/to/exact-file.md",
   "turns": 3,
-  "autoEnable": false
+  "autoEnable": false,
+  "template": false
 }
 ```
 
@@ -69,6 +70,7 @@ Pi-Live-<项目目录名>-<时间戳>.md
 | `livePath` | 默认精确目标文件 |
 | `turns` | 默认窗口大小 |
 | `autoEnable` | `false` 时完全关闭自动启用 |
+| `template` | `false` 时文件不带 YAML frontmatter，正文直接从 `## Me` 开始（默认 `true`） |
 
 缺失文件、JSON 损坏或字段非法时优雅降级（通知后使用默认值），不会报错崩溃。
 
@@ -80,6 +82,7 @@ Pi-Live-<项目目录名>-<时间戳>.md
 | `OBLIVE_PATH=<文件>` | 本次指定精确目标文件 |
 | `OBLIVE_DIR=<目录>` | 本次换一个目录（自动命名） |
 | `OBLIVE_TURNS=<n>` | 本次初始窗口大小 |
+| `OBLIVE_TEMPLATE=0/1` | 本次关闭/开启 YAML frontmatter |
 
 优先级：环境变量 > 配置文件 > 内置默认。
 

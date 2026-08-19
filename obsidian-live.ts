@@ -19,7 +19,8 @@
  *     "liveDir": "/path/to/vault/Notes",   // default directory
  *     "livePath": "/path/to/file.md",      // exact default file
  *     "turns": 3,                          // default window size
- *     "autoEnable": false                  // disable auto-enable
+ *     "autoEnable": false,                 // disable auto-enable
+ *     "template": false                    // omit YAML frontmatter
  *   }
  *
  * Environment overrides (per launch, highest priority):
@@ -27,6 +28,7 @@
  *   OBLIVE_PATH=<file>   Enable at this exact path instead of the default dir
  *   OBLIVE_DIR=<dir>     Enable in this directory with an auto-generated name
  *   OBLIVE_TURNS=<n>     Initial turn window
+ *   OBLIVE_TEMPLATE=0/1  Disable/enable YAML frontmatter
  *
  * Priority: env vars > config file > built-in default.
  *
@@ -67,6 +69,8 @@ import { basename, dirname, join, resolve } from "node:path";
 let enabled = false;
 let livePath: string | null = null;
 let turnCount = 1;
+/** Whether files start with the YAML frontmatter template (default true). */
+let withTemplate = true;
 /** ISO timestamp of when the current live file was enabled (frontmatter: created). */
 let createdAt: string | null = null;
 
@@ -434,6 +438,15 @@ function readTurnCountEnv(): number | null {
   return Number.isFinite(n) && n >= 1 ? n : null;
 }
 
+/** OBLIVE_TEMPLATE parsed as a boolean, or null if unset/invalid. */
+function readTemplateEnv(): boolean | null {
+  const raw = process.env.OBLIVE_TEMPLATE?.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "0" || raw === "false" || raw === "off") return false;
+  if (raw === "1" || raw === "true" || raw === "on") return true;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Machine-local configuration file (~/.pi/agent/oblive.json)
 // ---------------------------------------------------------------------------
@@ -443,6 +456,8 @@ interface ObliveConfig {
   livePath?: string;
   turns?: number;
   autoEnable?: boolean;
+  /** Whether files start with the YAML frontmatter template. Default true. */
+  template?: boolean;
 }
 
 /**
@@ -482,6 +497,9 @@ function loadConfig(ctx: ExtensionContext): ObliveConfig {
     if (typeof parsed.autoEnable === "boolean") {
       cfg.autoEnable = parsed.autoEnable;
     }
+    if (typeof parsed.template === "boolean") {
+      cfg.template = parsed.template;
+    }
     return cfg;
   } catch (error) {
     ctx.ui.notify(
@@ -516,8 +534,8 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
 async function writeNow(ctx: ExtensionContext): Promise<boolean> {
   if (!enabled || !livePath) return false;
   try {
-    const content =
-      buildFrontmatter(ctx) + renderTurns(currentTurns(ctx.sessionManager));
+    const body = renderTurns(currentTurns(ctx.sessionManager));
+    const content = withTemplate ? buildFrontmatter(ctx) + body : body;
     await atomicWrite(livePath, content);
     return true;
   } catch (error) {
@@ -560,6 +578,8 @@ export default function (pi: ExtensionAPI) {
           : nextAvailableAutoPath(cfg.liveDir ?? DEFAULT_LIVE_DIR, ctx.cwd);
     const n = readTurnCountEnv() ?? cfg.turns ?? null;
     if (n !== null) turnCount = n;
+    const t = readTemplateEnv() ?? cfg.template ?? null;
+    if (t !== null) withTemplate = t;
     createdAt = localIso();
     enabled = true;
     livePath = target;
