@@ -25,14 +25,18 @@
  *
  * Architecture:
  *   Pi session / streaming events
- *        ↓ extract existing user + assistant text only
+ *        ↓ extract user + assistant content in original order
  *   filesystem write (atomic: temp file + rename)
  *        ↓
  *   Pi-Live.md  →  Obsidian renders Markdown
  *
- * One "turn" = one user prompt + all assistant text generated in response
- * until the agent run fully settles (agent_settled). Tool calls, tool
- * results, thinking blocks, and internal messages never appear.
+ * One "turn" = one user prompt + all model output generated in response
+ * until the agent run fully settles (agent_settled). The full model output
+ * is preserved in order:
+ *   - assistant text                    (verbatim Markdown)
+ *   - thinking                          (Obsidian callout, folded by default)
+ *   - tool calls and tool results       (Obsidian callouts, folded by default)
+ * System messages, internal Pi messages, and metadata never appear.
  *
  * Assistant text is copied verbatim; this extension does not interpret,
  * transform, or summarize any content.
@@ -68,12 +72,11 @@ const DEFAULT_LIVE_DIR = "~/Documents/Obsidian/Pi-Live";
 interface LiveTurn {
   /** The raw expanded user prompt captured from before_agent_start. */
   prompt: string;
-  /** Assistant texts, one entry per assistant message in the current run. */
-  assistants: string[];
+  /** Sections of the assistant message currently streaming (not yet persisted). */
+  sections: Section[];
 }
 
 let liveTurn: LiveTurn | null = null;
-let streamingIndex = -1;
 
 // ---------------------------------------------------------------------------
 // Debounced writer
@@ -108,7 +111,7 @@ function scheduleWrite(ctx: ExtensionContext, delay: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// Text extraction (verbatim; content is never interpreted)
+// Content extraction (verbatim; content is never interpreted)
 // ---------------------------------------------------------------------------
 
 /** Extract only human-readable text blocks from a message content value. */
@@ -125,13 +128,57 @@ function extractText(content: unknown): string {
   return parts.join("\n");
 }
 
+/**
+ * Convert assistant message content blocks into ordered sections, preserving
+ * the original order: text, thinking, and tool calls exactly as the model
+ * produced them.
+ */
+function sectionsFromBlocks(content: unknown): Section[] {
+  if (!Array.isArray(content)) return [];
+  const sections: Section[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as {
+      type?: unknown;
+      text?: unknown;
+      thinking?: unknown;
+      name?: unknown;
+      arguments?: unknown;
+    };
+    if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) {
+      sections.push({ kind: "text", text: b.text });
+    } else if (
+      b.type === "thinking" &&
+      typeof b.thinking === "string" &&
+      b.thinking.length > 0
+    ) {
+      sections.push({ kind: "thinking", text: b.thinking });
+    } else if (b.type === "toolCall" && typeof b.name === "string") {
+      let args = "{}";
+      try {
+        args = JSON.stringify(b.arguments ?? {}, null, 2);
+      } catch {
+        args = JSON.stringify(String(b.arguments ?? ""));
+      }
+      sections.push({ kind: "toolCall", name: b.name, args });
+    }
+  }
+  return sections;
+}
+
 // ---------------------------------------------------------------------------
 // Turn reconstruction from the active session branch
 // ---------------------------------------------------------------------------
 
+type Section =
+  | { kind: "text"; text: string }
+  | { kind: "thinking"; text: string }
+  | { kind: "toolCall"; name: string; args: string }
+  | { kind: "toolResult"; name: string; content: string; isError: boolean };
+
 interface Turn {
   user: string;
-  assistants: string[];
+  sections: Section[];
 }
 
 interface SessionEntryLike {
@@ -139,6 +186,8 @@ interface SessionEntryLike {
   message?: {
     role?: string;
     content?: unknown;
+    toolName?: string;
+    isError?: boolean;
   };
 }
 
@@ -148,9 +197,9 @@ interface SessionManagerLike {
 
 /**
  * Walk the ACTIVE branch only (root -> leaf). Each user message starts a new
- * turn; assistant text is appended to the current turn. Everything else
- * (tool results, tool calls, thinking, custom/internal messages, model
- * changes, compactions, ...) is skipped.
+ * turn; assistant content (text, thinking, tool calls) and tool results are
+ * appended to the current turn in order. System/internal messages, model
+ * changes, compactions, and other non-conversation entries are skipped.
  */
 function sessionTurns(sm: SessionManagerLike): Turn[] {
   const turns: Turn[] = [];
@@ -158,12 +207,21 @@ function sessionTurns(sm: SessionManagerLike): Turn[] {
     if (entry.type !== "message" || !entry.message) continue;
     const msg = entry.message;
     if (msg.role === "user") {
-      turns.push({ user: extractText(msg.content), assistants: [] });
+      turns.push({ user: extractText(msg.content), sections: [] });
     } else if (msg.role === "assistant") {
-      const text = extractText(msg.content);
-      if (text.length === 0) continue;
-      if (turns.length === 0) turns.push({ user: "", assistants: [] });
-      turns[turns.length - 1].assistants.push(text);
+      const sections = sectionsFromBlocks(msg.content);
+      if (sections.length === 0) continue;
+      if (turns.length === 0) turns.push({ user: "", sections: [] });
+      turns[turns.length - 1].sections.push(...sections);
+    } else if (msg.role === "toolResult") {
+      const name = typeof msg.toolName === "string" ? msg.toolName : "tool";
+      if (turns.length === 0) turns.push({ user: "", sections: [] });
+      turns[turns.length - 1].sections.push({
+        kind: "toolResult",
+        name,
+        content: extractText(msg.content),
+        isError: msg.isError === true,
+      });
     }
   }
   return turns;
@@ -171,29 +229,82 @@ function sessionTurns(sm: SessionManagerLike): Turn[] {
 
 /**
  * Recent N turns: completed turns from the session plus, while the agent is
- * streaming, the in-progress turn captured from live events.
+ * streaming, the in-progress assistant message captured from live events.
  */
 function currentTurns(sm: SessionManagerLike): Turn[] {
   const turns = sessionTurns(sm);
-  if (liveTurn) {
-    const liveAssistants = liveTurn.assistants.filter((t) => t.length > 0);
+  if (liveTurn && liveTurn.sections.length > 0) {
     const last = turns[turns.length - 1];
     if (last && last.user === liveTurn.prompt) {
       // The live turn's user message is already persisted in the session;
-      // replace its (possibly partial) assistants with the live text.
-      last.assistants = liveAssistants;
+      // append the streaming message's sections after the persisted ones.
+      last.sections = [...last.sections, ...liveTurn.sections];
     } else {
       // User message not persisted yet (or prompt mismatch): append as new turn.
-      turns.push({ user: liveTurn.prompt, assistants: liveAssistants });
+      turns.push({ user: liveTurn.prompt, sections: [...liveTurn.sections] });
     }
   }
   return turns.slice(-turnCount);
 }
 
-/** Render turns as plain role-boundary Markdown. Content is copied verbatim. */
+// ---------------------------------------------------------------------------
+// Rendering (Obsidian-native folding via callouts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Obsidian callout, folded by default (the "-" suffix). Native fold/unfold
+ * in reading and live-preview modes. Every body line is prefixed with "> ".
+ */
+function callout(kind: string, title: string, body: string): string {
+  const lines = [`> [!${kind}]- ${title}`];
+  for (const line of body.split("\n")) lines.push(`> ${line}`);
+  return lines.join("\n");
+}
+
+/** Cap tool output for the reading surface; explicit truncation marker. */
+function truncateToolOutput(text: string): string {
+  const maxLines = 300;
+  const maxChars = 50000;
+  const lines = text.split("\n");
+  let out = lines.slice(0, maxLines).join("\n");
+  let truncated = lines.length > maxLines;
+  if (!truncated && out.length > maxChars) {
+    out = out.slice(0, maxChars);
+    truncated = true;
+  }
+  if (truncated) out += "\n… (output truncated for the reading view)";
+  return out;
+}
+
+/** Render one section. Text is copied verbatim; everything else is folded. */
+function renderSection(section: Section): string {
+  switch (section.kind) {
+    case "text":
+      return section.text;
+    case "thinking":
+      return callout("note", "Thinking", section.text);
+    case "toolCall":
+      return callout(
+        "info",
+        `Tool: ${section.name}`,
+        "```json\n" + section.args + "\n```",
+      );
+    case "toolResult":
+      return callout(
+        section.isError ? "warning" : "quote",
+        section.isError
+          ? `Tool error: ${section.name}`
+          : `Tool result: ${section.name}`,
+        "```text\n" + truncateToolOutput(section.content) + "\n```",
+      );
+  }
+}
+
+/** Render turns as role-boundary Markdown with folded model-output sections. */
 function renderTurns(turns: Turn[]): string {
   const blocks = turns.map((turn) => {
-    const pi = turn.assistants.length > 0 ? turn.assistants.join("\n\n") : "";
+    const rendered = turn.sections.map(renderSection).filter((s) => s.length > 0);
+    const pi = rendered.length > 0 ? rendered.join("\n\n") : "";
     return `## Me\n\n${turn.user}\n\n## Pi\n\n${pi}`;
   });
   return blocks.join("\n\n\n\n") + "\n";
@@ -379,7 +490,6 @@ export default function (pi: ExtensionAPI) {
     enabled = true;
     livePath = target;
     liveTurn = null;
-    streamingIndex = -1;
     cancelPendingWrite();
     if (await writeNow(ctx)) {
       ctx.ui.notify(
@@ -395,41 +505,39 @@ export default function (pi: ExtensionAPI) {
   // --- turn start: capture the user prompt -------------------------------
   pi.on("before_agent_start", async (event, ctx) => {
     if (!enabled || !livePath) return;
-    liveTurn = { prompt: event.prompt, assistants: [] };
-    streamingIndex = -1;
+    liveTurn = { prompt: event.prompt, sections: [] };
     scheduleWrite(ctx, 0);
   });
 
   // --- assistant streaming ------------------------------------------------
+  // The streaming message is rebuilt from each partial update and merged
+  // into the view on write; on message_end it is dropped because the session
+  // persists the final version (extensions run before persistence).
   pi.on("message_start", async (event, ctx) => {
     if (!enabled || !liveTurn) return;
     if (event.message.role !== "assistant") return;
-    streamingIndex = liveTurn.assistants.length;
-    liveTurn.assistants.push("");
+    liveTurn.sections = [];
     scheduleWrite(ctx, 200);
   });
 
   pi.on("message_update", async (event, ctx) => {
-    if (!enabled || !liveTurn || streamingIndex < 0) return;
+    if (!enabled || !liveTurn) return;
     if (event.message.role !== "assistant") return;
-    liveTurn.assistants[streamingIndex] = extractText(event.message.content);
+    liveTurn.sections = sectionsFromBlocks(event.message.content);
     scheduleWrite(ctx, 300);
   });
 
   pi.on("message_end", async (event, ctx) => {
     if (!enabled || !liveTurn) return;
     if (event.message.role !== "assistant") return;
-    if (streamingIndex >= 0 && streamingIndex < liveTurn.assistants.length) {
-      liveTurn.assistants[streamingIndex] = extractText(event.message.content);
-    }
-    scheduleWrite(ctx, 100);
+    liveTurn.sections = [];
+    scheduleWrite(ctx, 150);
   });
 
   // --- turn finished: authoritative final write from the session ----------
   pi.on("agent_settled", async (_event, ctx) => {
     if (!enabled || !livePath) return;
     liveTurn = null;
-    streamingIndex = -1;
     await writeNow(ctx);
   });
 
@@ -472,7 +580,6 @@ export default function (pi: ExtensionAPI) {
           enabled = false;
           livePath = null;
           liveTurn = null;
-          streamingIndex = -1;
           cancelPendingWrite();
           ctx.ui.notify("Obsidian Live: OFF", "info");
           return;
@@ -505,7 +612,6 @@ export default function (pi: ExtensionAPI) {
         turnCount = 1;
         createdAt = localIso();
         liveTurn = null;
-        streamingIndex = -1;
         cancelPendingWrite();
         if (await writeNow(ctx)) {
           ctx.ui.notify(

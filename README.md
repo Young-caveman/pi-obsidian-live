@@ -5,7 +5,7 @@
 ```text
 Pi session / streaming events
           ↓
-extract existing user + assistant text
+extract user + assistant content in original order
           ↓
 filesystem write (atomic)
           ↓
@@ -17,8 +17,9 @@ Obsidian renders Markdown
 核心原则：
 
 - **不解释内容** — assistant 文本本身就是 Markdown，原样搬运（表格、代码块、LaTeX、Mermaid 都原样保留）
+- **完整保留模型输出** — thinking、tool call、tool result 都是模型回复的一部分，按原始顺序呈现，用 Obsidian 原生折叠块（callout）收起，点击即可展开
 - **单文件滑动窗口** — 只显示最近 N 轮，完整历史仍由 Pi 自己保存
-- **只含人读内容** — 过滤 thinking、tool call、tool result、系统消息、元数据
+- **只含会话内容** — 系统消息、内部 Pi 消息、元数据不出现
 
 ## 安装
 
@@ -86,7 +87,7 @@ tags:
 ---
 ```
 
-正文结构：
+正文结构（一轮 turn = 一次用户 prompt + 该次 agent run 的全部模型输出，按原始顺序）：
 
 ```markdown
 ## Me
@@ -96,14 +97,36 @@ tags:
 ## Pi
 
 <assistant Markdown 原文>
+
+> [!note]- Thinking
+> <模型的 thinking，原文；点击左侧箭头展开/收起>
+
+> [!info]- Tool: bash
+> ```json
+> {
+>   "command": "ls -la"
+> }
+> ```
+
+> [!quote]- Tool result: bash
+> ```text
+> <工具输出，超长自动截断>
+> ```
+
+<继续下一段 assistant Markdown>
 ```
 
-一轮（turn）= 一次用户 prompt + 该次 agent run 产生的全部 assistant 文本（中间穿插的 tool call / tool result 不出现）。
+折叠块说明：
+
+- Obsidian 原生 callout（`-` 后缀 = 默认折叠），阅读模式和实时预览都能点击展开/收起
+- Thinking → `[!note]-`；Tool call → `[!info]-`（参数为 json 代码块）；Tool result → `[!quote]-`（错误为 `[!warning]-`，输出为 text 代码块）
+- 想默认展开：把 `obsidian-live.ts` 里 `callout()` 的 `]-` 改成 `]`
+- 工具输出超过 300 行 / 50KB 时截断并标注（thinking 和 assistant 文本永不截断）
 
 ## 设计要点
 
 - **轮次边界**：`agent_settled`（agent run 完全结束，不会再有自动重试/压缩/后续消息）
-- **流式捕获**：`before_agent_start` 拿用户 prompt；`message_start` / `message_update` / `message_end` 拿 assistant 流式文本（只取 `type: "text"` 块）
+- **流式捕获**：`before_agent_start` 拿用户 prompt；`message_start` / `message_update` / `message_end` 拿 assistant 流式内容（text / thinking / toolCall 块按序重建）
 - **历史重建**：`ctx.sessionManager.getBranch()` 只走当前活跃分支（root → leaf），天然排除被放弃的兄弟分支
 - **写入策略**：流式期间约 300ms 去抖 + 临时文件 rename 原子替换（Obsidian 不会读到半截文件）
 - **配置不持久化**：V1 全部在内存里，重启后按环境变量/命令重新启用
