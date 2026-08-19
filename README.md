@@ -4,6 +4,13 @@ A tiny [Pi](https://github.com/earendil-works/pi-mono) extension that live-mirro
 the latest N turns of the current Pi conversation into a single Markdown file, so
 Obsidian becomes your reading surface for long responses.
 
+## Inspiration
+
+This project is a Pi-extension remake of the workflow from the video
+[**"How I Use AI to Learn Things"**](https://www.youtube.com/watch?v=kzcI5F4tGiU&t=752s)
+by **Eero Alvar** — streaming an AI conversation into a Markdown file that
+Obsidian renders as a live reading surface.
+
 ```text
 Pi session / streaming events
           ↓
