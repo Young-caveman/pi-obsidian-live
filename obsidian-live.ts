@@ -20,7 +20,9 @@
  *     "livePath": "/path/to/file.md",      // exact default file
  *     "turns": 3,                          // default window size
  *     "autoEnable": false,                 // disable auto-enable
- *     "template": false                    // omit YAML frontmatter
+ *     "template": false,                   // omit YAML frontmatter
+ *     "thinking": false,                   // omit thinking callouts
+ *     "tools": false                       // omit tool call / tool result callouts
  *   }
  *
  * Environment overrides (per launch, highest priority):
@@ -29,6 +31,8 @@
  *   OBLIVE_DIR=<dir>     Enable in this directory with an auto-generated name
  *   OBLIVE_TURNS=<n>     Initial turn window
  *   OBLIVE_TEMPLATE=0/1  Disable/enable YAML frontmatter
+ *   OBLIVE_THINKING=0/1  Disable/enable thinking callouts
+ *   OBLIVE_TOOLS=0/1     Disable/enable tool call / tool result callouts
  *
  * Priority: env vars > config file > built-in default.
  *
@@ -71,6 +75,10 @@ let livePath: string | null = null;
 let turnCount = 1;
 /** Whether files start with the YAML frontmatter template (default true). */
 let withTemplate = true;
+/** Whether thinking content blocks render as callouts (default true). */
+let showThinking = true;
+/** Whether tool call and tool result blocks render as callouts (default true). */
+let showTools = true;
 /** ISO timestamp of when the current live file was enabled (frontmatter: created). */
 let createdAt: string | null = null;
 
@@ -316,10 +324,23 @@ function renderSection(section: Section): string {
   }
 }
 
+/** Filter sections according to the current show-thinking / show-tools flags. */
+function visibleSections(sections: Section[]): Section[] {
+  return sections.filter((s) => {
+    if (s.kind === "thinking" && !showThinking) return false;
+    if ((s.kind === "toolCall" || s.kind === "toolResult") && !showTools) {
+      return false;
+    }
+    return true;
+  });
+}
+
 /** Render turns as role-boundary Markdown with folded model-output sections. */
 function renderTurns(turns: Turn[]): string {
   const blocks = turns.map((turn) => {
-    const rendered = turn.sections.map(renderSection).filter((s) => s.length > 0);
+    const rendered = visibleSections(turn.sections)
+      .map(renderSection)
+      .filter((s) => s.length > 0);
     const pi = rendered.length > 0 ? rendered.join("\n\n") : "";
     return `## Me\n\n${turn.user}\n\n## Pi\n\n${pi}`;
   });
@@ -447,6 +468,15 @@ function readTemplateEnv(): boolean | null {
   return null;
 }
 
+/** Parse a boolean env var (0/false/off = false, 1/true/on = true), else null. */
+function readBoolEnv(name: string): boolean | null {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "0" || raw === "false" || raw === "off") return false;
+  if (raw === "1" || raw === "true" || raw === "on") return true;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Machine-local configuration file (~/.pi/agent/oblive.json)
 // ---------------------------------------------------------------------------
@@ -458,6 +488,10 @@ interface ObliveConfig {
   autoEnable?: boolean;
   /** Whether files start with the YAML frontmatter template. Default true. */
   template?: boolean;
+  /** Whether thinking blocks render as callouts. Default true. */
+  thinking?: boolean;
+  /** Whether tool call / tool result blocks render as callouts. Default true. */
+  tools?: boolean;
 }
 
 /**
@@ -499,6 +533,12 @@ function loadConfig(ctx: ExtensionContext): ObliveConfig {
     }
     if (typeof parsed.template === "boolean") {
       cfg.template = parsed.template;
+    }
+    if (typeof parsed.thinking === "boolean") {
+      cfg.thinking = parsed.thinking;
+    }
+    if (typeof parsed.tools === "boolean") {
+      cfg.tools = parsed.tools;
     }
     return cfg;
   } catch (error) {
@@ -580,6 +620,10 @@ export default function (pi: ExtensionAPI) {
     if (n !== null) turnCount = n;
     const t = readTemplateEnv() ?? cfg.template ?? null;
     if (t !== null) withTemplate = t;
+    const th = readBoolEnv("OBLIVE_THINKING") ?? cfg.thinking ?? null;
+    if (th !== null) showThinking = th;
+    const tl = readBoolEnv("OBLIVE_TOOLS") ?? cfg.tools ?? null;
+    if (tl !== null) showTools = tl;
     createdAt = localIso();
     enabled = true;
     livePath = target;

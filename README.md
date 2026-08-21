@@ -79,7 +79,9 @@ meant to be committed** to a repository:
   "livePath": "/path/to/exact-file.md",
   "turns": 3,
   "autoEnable": false,
-  "template": false
+  "template": false,
+  "thinking": false,
+  "tools": false
 }
 ```
 
@@ -90,6 +92,12 @@ meant to be committed** to a repository:
 | `turns` | Default sliding-window size (default `1`) |
 | `autoEnable` | `false` disables auto-enable entirely |
 | `template` | `false` omits the YAML frontmatter block (default `true`) |
+| `thinking` | `false` omits thinking callouts (default `true`) |
+| `tools` | `false` omits both tool call and tool result callouts (default `true`) |
+
+Reading-only use cases (for example, using Pi as a tutor, where thinking and
+tool activity are noise) typically set `template`, `thinking`, and `tools` all to
+`false` to get a plain `## Me` / `## Pi` transcript.
 
 A missing file, malformed JSON, or invalid fields degrade gracefully: the
 extension notifies once and falls back to defaults — it never crashes.
@@ -103,6 +111,8 @@ extension notifies once and falls back to defaults — it never crashes.
 | `OBLIVE_DIR=<dir>` | Use this directory (auto-generated name) for this launch |
 | `OBLIVE_TURNS=<n>` | Initial window size for this launch |
 | `OBLIVE_TEMPLATE=0/1` | Disable/enable the YAML frontmatter for this launch |
+| `OBLIVE_THINKING=0/1` | Disable/enable thinking callouts for this launch |
+| `OBLIVE_TOOLS=0/1` | Disable/enable tool call / tool result callouts for this launch |
 
 Resolution order: **environment variables → config file → built-in default.**
 
@@ -179,6 +189,14 @@ function in `obsidian-live.ts`.
 
 Tool output is truncated beyond 300 lines / 50 KB with an explicit marker;
 thinking and assistant text are never truncated.
+
+### Hiding callouts entirely
+
+If thinking and tool activity are noise for your reading workflow (for example
+when using Pi purely as a tutor), set `thinking: false` and/or `tools: false`
+in the config file. The corresponding blocks are then omitted from the file
+entirely — not even the callout label remains — leaving a clean
+`## Me` / `## Pi` transcript.
 
 ## Design notes
 
