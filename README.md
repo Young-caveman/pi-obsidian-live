@@ -51,6 +51,9 @@ Then run `/reload` in Pi (or restart Pi).
 | `/oblive <n>` | Change the sliding-window size (positive integer) |
 | `/oblive status` | Show whether live view is on, the path, and the turn count |
 | `/oblive off` | Stop writing updates (the existing file is kept) |
+| `/oblive <flag> [on\|off]` | Toggle or set a flag: `repair`, `thinking`, `tools`, `template`. No value flips the current state. |
+
+Accepted boolean values for the toggle: `on`, `off`, `true`, `false`, `1`, `0` (case-insensitive). If the first token of the argument matches a flag name but the value is invalid, the command notifies an error rather than silently treating it as a path.
 
 ## Auto-enable
 
@@ -81,7 +84,8 @@ meant to be committed** to a repository:
   "autoEnable": false,
   "template": false,
   "thinking": false,
-  "tools": false
+  "tools": false,
+  "repair": false
 }
 ```
 
@@ -94,6 +98,7 @@ meant to be committed** to a repository:
 | `template` | `false` omits the YAML frontmatter block (default `true`) |
 | `thinking` | `false` omits thinking callouts (default `true`) |
 | `tools` | `false` omits both tool call and tool result callouts (default `true`) |
+| `repair` | `false` skips cascade-protection fence balancing at the end of a run (default `true`) |
 
 Reading-only use cases (for example, using Pi as a tutor, where thinking and
 tool activity are noise) typically set `template`, `thinking`, and `tools` all to
@@ -113,6 +118,7 @@ extension notifies once and falls back to defaults — it never crashes.
 | `OBLIVE_TEMPLATE=0/1` | Disable/enable the YAML frontmatter for this launch |
 | `OBLIVE_THINKING=0/1` | Disable/enable thinking callouts for this launch |
 | `OBLIVE_TOOLS=0/1` | Disable/enable tool call / tool result callouts for this launch |
+| `OBLIVE_REPAIR=0/1` | Disable/enable cascade-protection fence balancing for this launch |
 
 Resolution order: **environment variables → config file → built-in default.**
 
@@ -196,7 +202,21 @@ If thinking and tool activity are noise for your reading workflow (for example
 when using Pi purely as a tutor), set `thinking: false` and/or `tools: false`
 in the config file. The corresponding blocks are then omitted from the file
 entirely — not even the callout label remains — leaving a clean
-`## Me` / `## Pi` transcript.
+`## Me` / `## Pi` transcript. The same toggles are available at runtime via
+`/oblive thinking on|off` and `/oblive tools on|off`.
+
+### Cascade protection
+
+A single unclosed fenced code block in the model's output is the most common
+cause of a whole-file rendering failure in Obsidian (everything after the
+unclosed ``` renders as code). At the end of every run, `agent_settled`
+counts the triple-backtick fence lines in the rendered body; if the count is
+odd, one closing fence is appended. This is mechanical delimiter balancing —
+it never modifies model content and adds at most one line. Streaming writes
+do not perform this repair (it would clash with the model's own closing
+fence), so partial in-flight code blocks render as-is and normalize at the
+end of the run. Disable with `repair: false` in the config, `OBLIVE_REPAIR=0`
+per launch, or `/oblive repair off` at runtime.
 
 ## Design notes
 

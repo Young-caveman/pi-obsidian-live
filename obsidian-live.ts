@@ -5,10 +5,12 @@
  * current Pi conversation into a single Markdown file that Obsidian renders.
  *
  * Commands:
- *   /oblive <path>   Enable live view (default: latest 1 turn)
- *   /oblive <n>      Show the latest n turns (positive integer)
- *   /oblive status   Show current state
- *   /oblive off      Stop writing updates (file is kept)
+ *   /oblive <path>                                  Enable live view (default: latest 1 turn)
+ *   /oblive <n>                                     Show the latest n turns (positive integer)
+ *   /oblive status                                  Show current state
+ *   /oblive off                                     Stop writing updates (file is kept)
+ *   /oblive {repair|thinking|tools|template} [on|off]
+ *                                                  Toggle or set each flag (no value = flip current)
  *
  * Auto-enable (ON by default): every session writes a live file to the
  * default vault directory (DEFAULT_LIVE_DIR below) with an auto-generated
@@ -55,8 +57,16 @@
  *   - tool calls and tool results       (Obsidian callouts, folded by default)
  * System messages, internal Pi messages, and metadata never appear.
  *
- * Assistant text is copied verbatim; this extension does not interpret,
- * transform, or summarize any content.
+ * Markdown cascade protection: at the end of a run the rendered body is
+ * checked for an odd number of triple-backtick fence lines; if so, one
+ * closing fence is appended. This is mechanical delimiter balancing only
+ * (never changes model content) and prevents a single unclosed code block
+ * from causing the rest of the file to render as code. Streaming writes
+ * skip this check, so partial in-flight code blocks render normally and
+ * normalize at agent_settled.
+ *
+ * Assistant text is otherwise copied verbatim; this extension does not
+ * interpret, transform, or summarize any content.
  */
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -79,6 +89,8 @@ let withTemplate = true;
 let showThinking = true;
 /** Whether tool call and tool result blocks render as callouts (default true). */
 let showTools = true;
+/** Whether cascade-protection fence balancing runs at agent_settled (default true). */
+let repair = true;
 /** ISO timestamp of when the current live file was enabled (frontmatter: created). */
 let createdAt: string | null = null;
 
@@ -109,6 +121,10 @@ let liveTurn: LiveTurn | null = null;
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let scheduledDelay = Number.POSITIVE_INFINITY;
 let lastErrorNotifyAt = 0;
+
+function onOff(b: boolean): string {
+  return b ? "on" : "off";
+}
 
 function cancelPendingWrite(): void {
   if (writeTimer !== null) {
@@ -492,6 +508,8 @@ interface ObliveConfig {
   thinking?: boolean;
   /** Whether tool call / tool result blocks render as callouts. Default true. */
   tools?: boolean;
+  /** Whether cascade-protection fence balancing runs at agent_settled. Default true. */
+  repair?: boolean;
 }
 
 /**
@@ -540,6 +558,9 @@ function loadConfig(ctx: ExtensionContext): ObliveConfig {
     if (typeof parsed.tools === "boolean") {
       cfg.tools = parsed.tools;
     }
+    if (typeof parsed.repair === "boolean") {
+      cfg.repair = parsed.repair;
+    }
     return cfg;
   } catch (error) {
     ctx.ui.notify(
@@ -570,11 +591,16 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
   }
 }
 
-/** Build the current view and write it. Never throws. */
-async function writeNow(ctx: ExtensionContext): Promise<boolean> {
+/** Build the current view and write it. Never throws.
+ *  `opts.repair` triggers cascade-protection at the end of a run. */
+async function writeNow(
+  ctx: ExtensionContext,
+  opts: { repair?: boolean } = {},
+): Promise<boolean> {
   if (!enabled || !livePath) return false;
   try {
-    const body = renderTurns(currentTurns(ctx.sessionManager));
+    let body = renderTurns(currentTurns(ctx.sessionManager));
+    if (opts.repair) body = repairMarkdown(body);
     const content = withTemplate ? buildFrontmatter(ctx) + body : body;
     await atomicWrite(livePath, content);
     return true;
@@ -591,6 +617,23 @@ function notifyWriteError(ctx: ExtensionContext, message: string): void {
     lastErrorNotifyAt = now;
     ctx.ui.notify(`Obsidian Live: file write failed: ${message}`, "error");
   }
+}
+
+/**
+ * Minimal cascade-protection for the final rendered body. Counts lines
+ * beginning with triple backticks (the only markdown construct whose
+ * unclosed state corrupts the rest of the file); if the count is odd,
+ * appends one closing fence line. Never modifies model content - adds at
+ * most one line. Applied only at the end of a run (agent_settled), never
+ * during streaming, to avoid clashing with the model's own closing fence.
+ */
+function repairMarkdown(text: string): string {
+  let fenceCount = 0;
+  for (const line of text.split("\n")) {
+    if (/^```/.test(line)) fenceCount++;
+  }
+  if (fenceCount % 2 === 1) return text + "\n```\n";
+  return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +667,8 @@ export default function (pi: ExtensionAPI) {
     if (th !== null) showThinking = th;
     const tl = readBoolEnv("OBLIVE_TOOLS") ?? cfg.tools ?? null;
     if (tl !== null) showTools = tl;
+    const rp = readBoolEnv("OBLIVE_REPAIR") ?? cfg.repair ?? null;
+    if (rp !== null) repair = rp;
     createdAt = localIso();
     enabled = true;
     livePath = target;
@@ -676,7 +721,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     if (!enabled || !livePath) return;
     liveTurn = null;
-    await writeNow(ctx);
+    await writeNow(ctx, { repair });
   });
 
   // --- cleanup on session teardown -----------------------------------------
@@ -692,7 +737,11 @@ export default function (pi: ExtensionAPI) {
       try {
         if (arg === "" || arg === "help") {
           ctx.ui.notify(
-            "Obsidian Live: /oblive <path> | /oblive <n> | /oblive status | /oblive off",
+            "Obsidian Live:\n" +
+              "  /oblive <path|n>            enable at path or set turn count\n" +
+              "  /oblive status | off        show state | stop writing\n" +
+              "  /oblive {repair|thinking|tools|template} [on|off]\n" +
+              "                             toggle or set a flag (no value = flip)",
             "info",
           );
           return;
@@ -703,7 +752,11 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify("Obsidian Live: OFF", "info");
           } else {
             ctx.ui.notify(
-              `Obsidian Live: ON\nPath: ${livePath}\nTurns: ${turnCount}`,
+              `Obsidian Live: ON\n` +
+                `Path: ${livePath}\n` +
+                `Turns: ${turnCount}\n` +
+                `Template: ${onOff(withTemplate)}  Repair: ${onOff(repair)}\n` +
+                `Thinking: ${onOff(showThinking)}  Tools: ${onOff(showTools)}`,
               "info",
             );
           }
@@ -735,6 +788,55 @@ export default function (pi: ExtensionAPI) {
           turnCount = n;
           ctx.ui.notify(
             `Obsidian Live: showing last ${n} turn${n === 1 ? "" : "s"}`,
+            "info",
+          );
+          if (enabled && livePath) await writeNow(ctx);
+          return;
+        }
+
+        // Toggle subcommands: /oblive <flag> [on|off] (no value flips current).
+        // If the first token looks like a flag name, we treat the whole arg as
+        // a toggle command (even when the value is invalid, which becomes an
+        // error notification rather than silently treating it as a path).
+        // Paths starting with "/" or "~" are unaffected; relative paths whose
+        // first token coincidentally matches a flag name fall through to the
+        // path branch only when the token is not exactly the flag (e.g.
+        // "tools.md" - ".md" makes the first token not match).
+        const flagNames = ["repair", "thinking", "tools", "template"] as const;
+        const firstWord = arg.split(/\s+/)[0]?.toLowerCase();
+        if (
+          firstWord !== undefined &&
+          (flagNames as readonly string[]).includes(firstWord)
+        ) {
+          const toggleMatch =
+            /^(repair|thinking|tools|template)(?:\s+(on|off|true|false|0|1))?$/i.exec(arg);
+          if (!toggleMatch) {
+            ctx.ui.notify(
+              `Obsidian Live: invalid value for ${firstWord} (use on/off/true/false/0/1, or omit to toggle)`,
+              "error",
+            );
+            return;
+          }
+          const flag = toggleMatch[1].toLowerCase();
+          const valueArg = toggleMatch[2]?.toLowerCase();
+          const current =
+            flag === "repair"
+              ? repair
+              : flag === "thinking"
+                ? showThinking
+                : flag === "tools"
+                  ? showTools
+                  : withTemplate;
+          const newValue =
+            valueArg === undefined
+              ? !current
+              : ["on", "true", "1"].includes(valueArg);
+          if (flag === "repair") repair = newValue;
+          else if (flag === "thinking") showThinking = newValue;
+          else if (flag === "tools") showTools = newValue;
+          else withTemplate = newValue;
+          ctx.ui.notify(
+            `Obsidian Live: ${flag} ${newValue ? "on" : "off"}`,
             "info",
           );
           if (enabled && livePath) await writeNow(ctx);
