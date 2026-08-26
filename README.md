@@ -57,19 +57,30 @@ For a global install from a published package or Git repository, use the
 corresponding `npm:` or `git:` source. Then run `/reload` in Pi (or restart Pi).
 
 Hybrid retrieval is an optional runtime enhancement. The package itself has no
-mandatory vector/native dependency, so a fresh install works with BM25. To
-enable the local open-source embedding provider, install the optional peer in
-the package directory:
+mandatory vector/native dependency, so a fresh install works with BM25. Two
+optional embedding providers are available: the local open-source provider
+(install the peer in the package directory):
 
 ```bash
 npm install @huggingface/transformers
 ```
+
+or the hosted OpenRouter embeddings API, which only needs an API key (see
+"Remote embeddings via OpenRouter" below).
 
 The old `~/.pi/agent/oblive.json` and `OBLIVE_*` configuration remain
 compatible. The package entry point is still `obsidian-live.ts`, so existing
 `/oblive` behavior is preserved.
 
 ## Commands
+
+The package registers three slash commands — `/oblive`, `/space`, and `/memory` —
+all from the same extension. After installing the package and restarting Pi (or
+`/reload`), every command below is recognized. Memory behavior itself stays
+opt-in: recall/generation only start once the session memory mode and a
+mounted Space allow them (see the mode table under `/memory`).
+
+### Live view: `/oblive`
 
 | Command | Effect |
 |---|---|
@@ -78,21 +89,94 @@ compatible. The package entry point is still `obsidian-live.ts`, so existing
 | `/oblive status` | Show whether live view is on, the path, and the turn count |
 | `/oblive off` | Stop writing updates (the existing file is kept) |
 | `/oblive <flag> [on\|off]` | Toggle or set a flag: `repair`, `thinking`, `tools`, `template`. No value flips the current state. |
-| `/space list` | List registered Learning Spaces |
+
+Always usable; needs no configuration to answer, though auto-enable itself can
+be disabled via config/env (`autoEnable: false`, `OBLIVE_OFF=1`).
+
+Accepted boolean values for the toggle: `on`, `off`, `true`, `false`, `1`, `0`
+(case-insensitive). If the first token of the argument matches a flag name but
+the value is invalid, the command notifies an error rather than silently
+treating it as a path.
+
+### Spaces: `/space`
+
+| Command | Effect |
+|---|---|
+| `/space list` | List registered Learning Spaces with accepted-memory counts |
 | `/space new <name> [path]` | Create a Space under `dataRoot`, or at an explicit path |
 | `/space use <name>` | Mount one Space in this Pi session |
 | `/space off` | Unmount the Space in this Pi session |
-| `/space status` | Show the session's mounted Space and data root |
-| `/memory status` | Show memory mode, mounted Space, pending jobs, and backend |
+| `/space status` | Show the session's mounted Space, data root, and memory counts |
+
+Always usable. Needs no pre-configuration: the first command creates
+`dataRoot` and `registry.json` on demand. The selected Space is stored in the
+session branch, so it survives resume/fork/tree navigation.
+
+### Memory: `/memory`
+
+| Command | Effect |
+|---|---|
+| `/memory status` | Show memory mode, mounted Space, memory counts, pending jobs, and backend |
 | `/memory off` | Disable recall and generation for this session |
 | `/memory read` | Enable recall without generation |
 | `/memory on` | Enable recall and candidate generation (`read-write`) |
 | `/memory capture` | Queue and process the current visible turn as candidates |
 | `/memory review` | List candidate files waiting in the Space inbox |
-| `/memory accept <id>` | Promote one candidate to accepted memory |
+| `/memory accept <id> [more ids...]` | Promote one or more candidates to accepted memory |
 | `/memory reject <id> [reason]` | Move one candidate to the Space rejected archive |
 
-Accepted boolean values for the toggle: `on`, `off`, `true`, `false`, `1`, `0` (case-insensitive). If the first token of the argument matches a flag name but the value is invalid, the command notifies an error rather than silently treating it as a path.
+**Prerequisites per subcommand** (violations notify an error, never crash):
+
+| Subcommand | Needs session mode | Needs a mounted Space |
+|---|---|---|
+| `status` | any | no |
+| `off` / `read` / `on` | any | no |
+| `capture` | `read-write` | yes |
+| `review` | any | yes |
+| `accept <id>` / `reject <id> [reason]` | any | yes (candidate must exist there) |
+
+**Memory modes** decide what happens automatically during agent turns:
+
+| Mode | Recall into prompts | Generate candidates |
+|---|---|---|
+| `off` (default) | never | never |
+| `read` | yes | no (manual `capture` also blocked) |
+| `read-write` (`on`) | yes | yes (auto after idle window, and via `capture`) |
+
+Mode is session-local (`/memory on` needed again after a restart, unless
+`PILIVE_MEMORY_MODE` or the config file sets one). Recall also needs at least
+one accepted memory in the mounted Space; generation needs `autoCapture`
+(which `capture` bypasses) and a visible turn shorter than `minTextChars` is
+skipped.
+
+**Why review exists.** Extraction is deliberately conservative but not
+infallible. Candidates never enter recall context until `/memory accept`
+moves them to accepted memory — an operator gate that keeps transient chat
+garbage and model guesses out of long-term memory. Two opt-in shortcuts keep
+the gate without losing it: `accept` takes multiple ids in one command, and
+setting `memory.autoAcceptMinConfidence` (e.g. `0.9`) or
+`PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE=0.9` promotes candidates at or above that
+confidence straight to accepted memory during capture, leaving everything
+below the threshold in the inbox for review.
+
+### End-to-end quick start
+
+```text
+/space new learn-event       # 1. create a Learning Space
+/space use learn-event       # 2. mount it in this session
+/memory on                   # 3. enable recall + generation
+# ask Pi something with durable content (concepts, procedures, preferences)
+/memory capture              # 4. extract the current turn into candidates
+/memory review               # 5. list candidates (mem-job-xxx-N [kind, confidence=...])
+/memory accept mem-...-1     # 6. accept what is worth remembering
+# ask a related question — accepted memories are now recalled automatically
+/space status                # 7. check: Memories: N accepted confirms recall source
+```
+
+The next turn's `before_agent_start` embeds the accepted memory and your
+question (via the configured embedding backend) and injects matching records
+as untrusted, escaped context. `~/.pi/agent/pi-live-data/spaces/<id>/index/vectors.json`
+appears once a recall ran.
 
 ## Auto-enable
 
@@ -186,8 +270,10 @@ Obsidian live view. Add an optional `~/.pi/agent/pi-live.json`:
     "jobLeaseMs": 90000,
     "maxJobAttempts": 3,
     "shutdownTimeoutMs": 1500,
+    "autoAcceptMinConfidence": 0.9,
     "retrieval": {
       "mode": "auto",
+      "provider": "local",
       "model": "onnx-community/all-MiniLM-L6-v2-ONNX",
       "rrfK": 60
     }
@@ -198,7 +284,9 @@ Obsidian live view. Add an optional `~/.pi/agent/pi-live.json`:
 `PILIVE_DATA_ROOT` and `PILIVE_MEMORY_MODE` (`off`, `read`, `read-write`, or
 `on`) are optional launch-time overrides. Retrieval can also be controlled with
 `PILIVE_RETRIEVAL_MODE` (`auto`, `lexical`, or `hybrid`) and
-`PILIVE_EMBEDDING_MODEL`. The default data root is:
+`PILIVE_EMBEDDING_MODEL`. `PILIVE_EMBEDDING_PROVIDER` (`local` or `openrouter`)
+selects where embedding vectors come from, and `OPENROUTER_API_KEY` supplies
+the OpenRouter credential. The default data root is:
 
 ```text
 ~/.pi/agent/pi-live-data/
@@ -253,6 +341,49 @@ provenance. The surrounding prompt marks these records as untrusted reference
 data and explicitly excludes commands, policy, permissions, or other embedded
 instructions. Invalid queue JSON/schema records are moved to the Space's
 `jobs/quarantine/` directory so one damaged job cannot block the queue.
+
+### Remote embeddings via OpenRouter
+
+To use your own hosted embedding model instead of local weights, select the
+OpenRouter provider and export a key:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+```
+
+```json
+{
+  "memory": {
+    "retrieval": {
+      "provider": "openrouter",
+      "model": "openai/text-embedding-3-small"
+    }
+  }
+}
+```
+
+The package calls the OpenAI-compatible endpoint
+`POST https://openrouter.ai/api/v1/embeddings` with bearer authentication,
+sending memory texts in bounded batches and queries individually with
+`encoding_format: float`. Requests carry a bounded timeout, and responses are
+validated entry by entry (batch size, finite vectors, order restored from each
+element's `index`).
+
+- `provider` defaults to `local` (Transformers.js). Set it to `openrouter` per
+  launch instead with `PILIVE_EMBEDDING_PROVIDER=openrouter`.
+- `model` defaults to `openai/text-embedding-3-small` for OpenRouter;
+  `memory.retrieval.model` or `PILIVE_EMBEDDING_MODEL` picks any other
+  embeddings model listed by OpenRouter.
+- As a machine-local fallback when environment variables are inconvenient,
+  `memory.retrieval.apiKey` can hold the key inside `pi-live.json`; prefer the
+  environment variable.
+
+Failure semantics match the local provider exactly. A missing key, network
+error, non-2xx status, or malformed payload never blocks the agent turn:
+recall silently returns the BM25 result set, `/memory status` appends a warning
+when the provider is selected without a key, and switching providers or models
+rebuilds each Space's vector index automatically because the index records its
+own provider and model.
 
 ### Hybrid retrieval
 
@@ -376,7 +507,7 @@ per launch, or `/oblive repair off` at runtime.
 | Space state | Session custom entries on the active branch; `/space use` and `/space off` survive resume/fork/tree navigation correctly |
 | Memory state | JSON records and durable jobs under the configured data root; accepted records are the only recall source |
 | Background work | Idle/debounce scheduling, expiring leases, bounded retries, abortable model requests, and bounded shutdown wait |
-| Retrieval | BM25 lexical ranking plus optional Transformers.js vectors, per-Space incremental JSON indexes, RRF fusion, and silent lexical fallback |
+| Retrieval | BM25 lexical ranking plus optional Transformers.js vectors or the OpenRouter embeddings API, per-Space incremental JSON indexes, RRF fusion, and silent lexical fallback |
 
 ## License
 
