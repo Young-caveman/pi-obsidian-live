@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
+import type { RetrievalMode } from "./config.js";
+import { DEFAULT_EMBEDDING_MODEL, resolvePath } from "./config.js";
+import { atomicWrite, enqueueSpaceWrite } from "./storage.js";
 import type { SpaceDefinition } from "./space.js";
-import { resolvePath } from "./config.js";
 
 export interface MemoryProvenance {
   spaceId: string;
@@ -21,6 +24,7 @@ export interface AcceptedMemory extends MemoryProvenance {
 
 export interface RetrievalResult {
   memory: AcceptedMemory;
+  /** Lexical score for lexical retrieval, or fused RRF score for hybrid retrieval. */
   score: number;
 }
 
@@ -28,6 +32,23 @@ export interface RetrievalBackend {
   readonly name: string;
   search(spaces: readonly SpaceDefinition[], query: string, limit: number): Promise<RetrievalResult[]>;
 }
+
+export interface EmbeddingProvider {
+  readonly name: string;
+  readonly modelId: string;
+  embed(texts: readonly string[]): Promise<readonly (readonly number[])[]>;
+}
+
+export interface RetrievalBackendOptions {
+  mode?: RetrievalMode;
+  model?: string;
+  rrfK?: number;
+  embeddingProvider?: EmbeddingProvider;
+}
+
+const DEFAULT_RRF_K = 60;
+const VECTOR_BATCH_SIZE = 32;
+const MAX_SEMANTIC_CANDIDATES = 100;
 
 const STOP_WORDS = new Set([
   "about", "after", "also", "been", "being", "from", "have", "into", "just", "more", "than", "that", "their", "them", "there", "these", "they", "this", "what", "when", "where", "which", "with", "would", "your",
@@ -37,19 +58,59 @@ export function lexicalTokens(text: string): string[] {
   return text.toLocaleLowerCase().match(/[\p{L}\p{N}_-]{2,}/gu)?.filter((token) => !STOP_WORDS.has(token)) ?? [];
 }
 
-export function lexicalScore(query: string, text: string): number {
+interface LexicalStats {
+  documentCount: number;
+  averageDocumentLength: number;
+  documentFrequency: Map<string, number>;
+}
+
+function buildLexicalStats(texts: readonly string[]): LexicalStats {
+  const documentFrequency = new Map<string, number>();
+  let totalLength = 0;
+  for (const text of texts) {
+    const documentTokens = lexicalTokens(text);
+    const tokens = new Set(documentTokens);
+    totalLength += documentTokens.length;
+    for (const token of tokens) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+  }
+  return {
+    documentCount: Math.max(1, texts.length),
+    averageDocumentLength: Math.max(1, totalLength / Math.max(1, texts.length)),
+    documentFrequency,
+  };
+}
+
+function bm25ScoreWithStats(query: string, text: string, stats: LexicalStats): number {
   const queryTokens = lexicalTokens(query);
   if (queryTokens.length === 0) return 0;
-  const haystack = text.toLocaleLowerCase();
-  const tokens = new Set(lexicalTokens(text));
+  const documentTokens = lexicalTokens(text);
+  if (documentTokens.length === 0) return 0;
+  const frequencies = new Map<string, number>();
+  for (const token of documentTokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+  const k1 = 1.2;
+  const b = 0.75;
   let score = 0;
-  for (const token of queryTokens) {
-    if (tokens.has(token)) score += 1;
-    else if (haystack.includes(token)) score += 0.25;
+  for (const token of new Set(queryTokens)) {
+    const termFrequency = frequencies.get(token) ?? 0;
+    if (termFrequency === 0) continue;
+    const documentFrequency = stats.documentFrequency.get(token) ?? 0;
+    const idf = Math.log(1 + (stats.documentCount - documentFrequency + 0.5) / (documentFrequency + 0.5));
+    const normalization = k1 * (1 - b + b * documentTokens.length / stats.averageDocumentLength);
+    score += idf * (termFrequency * (k1 + 1)) / (termFrequency + normalization);
   }
   const phrase = query.trim().toLocaleLowerCase();
-  if (phrase.length >= 8 && haystack.includes(phrase)) score += 2;
-  return score / queryTokens.length;
+  if (phrase.length >= 8 && text.toLocaleLowerCase().includes(phrase)) score += 1;
+  return score;
+}
+
+/** BM25-like lexical score kept as a small public utility for callers/tests. */
+export function bm25Score(query: string, text: string, corpus: readonly string[] = [text]): number {
+  return bm25ScoreWithStats(query, text, buildLexicalStats(corpus));
+}
+
+/** Backwards-compatible lexical score name. The backend now uses BM25 ranking. */
+export function lexicalScore(query: string, text: string): number {
+  return bm25Score(query, text);
 }
 
 async function readAcceptedMemories(space: SpaceDefinition): Promise<AcceptedMemory[]> {
@@ -87,35 +148,290 @@ async function readAcceptedMemories(space: SpaceDefinition): Promise<AcceptedMem
 }
 
 export class LexicalRetrievalBackend implements RetrievalBackend {
-  readonly name = "lexical";
+  readonly name = "lexical-bm25";
 
   async search(spaces: readonly SpaceDefinition[], query: string, limit: number): Promise<RetrievalResult[]> {
     const records = (await Promise.all(spaces.map(readAcceptedMemories))).flat();
+    const stats = buildLexicalStats(records.map((record) => record.text));
     return records
-      .map((memory) => ({ memory, score: lexicalScore(query, memory.text) }))
+      .map((memory) => ({ memory, score: bm25ScoreWithStats(query, memory.text, stats) }))
       .filter((result) => result.score > 0)
       .sort((a, b) => b.score - a.score || b.memory.createdAt.localeCompare(a.memory.createdAt) || a.memory.id.localeCompare(b.memory.id))
       .slice(0, Math.max(1, limit));
   }
 }
 
-/**
- * Feature detection hook for a future embedded LanceDB implementation.
- * It deliberately does not import or call an unverified LanceDB API. The
- * lexical backend remains the safe fallback when the optional package is not
- * installed or native bindings are unavailable.
- */
+interface VectorIndexRecord {
+  id: string;
+  fingerprint: string;
+  vector: number[];
+}
+
+interface VectorIndexFile {
+  version: 1;
+  spaceId: string;
+  provider: string;
+  model: string;
+  dimensions: number;
+  updatedAt: string;
+  records: VectorIndexRecord[];
+}
+
+function vectorIndexPath(space: SpaceDefinition): string {
+  return join(resolvePath(space.path), "index", "vectors.json");
+}
+
+function fingerprint(memory: Pick<AcceptedMemory, "id" | "text">): string {
+  return createHash("sha256").update(`${memory.id}\0${memory.text}`).digest("hex");
+}
+
+function normalizeVector(vector: readonly number[]): number[] {
+  const values = vector.map(Number);
+  if (values.length === 0 || values.some((value) => !Number.isFinite(value))) throw new Error("Embedding provider returned an invalid vector");
+  const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
+  if (!Number.isFinite(norm) || norm <= 0) throw new Error("Embedding provider returned a zero vector");
+  return values.map((value) => value / norm);
+}
+
+function validVectorRecord(value: unknown, dimensions?: number): value is VectorIndexRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<VectorIndexRecord>;
+  return typeof record.id === "string" && typeof record.fingerprint === "string" && Array.isArray(record.vector) &&
+    record.vector.length > 0 && (dimensions === undefined || record.vector.length === dimensions) &&
+    record.vector.every((number) => typeof number === "number" && Number.isFinite(number));
+}
+
+async function readVectorIndex(space: SpaceDefinition, provider: EmbeddingProvider): Promise<VectorIndexFile | undefined> {
+  try {
+    const value = JSON.parse(await fs.readFile(vectorIndexPath(space), "utf8")) as Partial<VectorIndexFile>;
+    if (value.version !== 1 || value.spaceId !== space.id || value.provider !== provider.name || value.model !== provider.modelId || !Array.isArray(value.records)) return undefined;
+    const dimensions = typeof value.dimensions === "number" && Number.isInteger(value.dimensions) ? value.dimensions : undefined;
+    if (!dimensions || !value.records.every((record) => validVectorRecord(record, dimensions))) return undefined;
+    return {
+      version: 1,
+      spaceId: space.id,
+      provider: provider.name,
+      model: provider.modelId,
+      dimensions,
+      updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : new Date(0).toISOString(),
+      records: value.records,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    // A damaged derived index is rebuilt when the optional provider works.
+    return undefined;
+  }
+}
+
+async function writeVectorIndex(space: SpaceDefinition, index: VectorIndexFile): Promise<void> {
+  await atomicWrite(vectorIndexPath(space), JSON.stringify(index, null, 2) + "\n");
+}
+
+async function embedInBatches(provider: EmbeddingProvider, records: readonly AcceptedMemory[]): Promise<Map<string, number[]>> {
+  const vectors = new Map<string, number[]>();
+  for (let start = 0; start < records.length; start += VECTOR_BATCH_SIZE) {
+    const batch = records.slice(start, start + VECTOR_BATCH_SIZE);
+    const embedded = await provider.embed(batch.map((record) => record.text));
+    if (embedded.length !== batch.length) throw new Error("Embedding provider returned the wrong batch size");
+    for (let index = 0; index < batch.length; index++) vectors.set(batch[index].id, normalizeVector(embedded[index]));
+  }
+  return vectors;
+}
+
+async function ensureVectorIndex(space: SpaceDefinition, memories: readonly AcceptedMemory[], provider: EmbeddingProvider): Promise<VectorIndexFile> {
+  const existing = await readVectorIndex(space, provider);
+  const existingById = new Map(existing?.records.map((record) => [record.id, record]) ?? []);
+  const missing = memories.filter((memory) => {
+    const record = existingById.get(memory.id);
+    return !record || record.fingerprint !== fingerprint(memory);
+  });
+  const hasStaleRecords = !existing || existing.records.length !== memories.length || memories.some((memory) => !existingById.has(memory.id));
+  if (existing && missing.length === 0 && !hasStaleRecords) return existing;
+  const embedded = missing.length > 0 ? await embedInBatches(provider, missing) : new Map<string, number[]>();
+  const dimensions = existing?.dimensions ?? embedded.values().next().value?.length;
+  if (dimensions === undefined && memories.length > 0) throw new Error("Embedding provider returned no dimensions");
+  if (dimensions !== undefined) {
+    for (const vector of embedded.values()) {
+      if (vector.length !== dimensions) throw new Error("Embedding dimensions changed inside one Learning Space");
+    }
+  }
+
+  return enqueueSpaceWrite(space.path, async () => {
+    const latest = await readVectorIndex(space, provider);
+    const latestById = new Map(latest?.records.map((record) => [record.id, record]) ?? []);
+    const records: VectorIndexRecord[] = [];
+    for (const memory of memories) {
+      const current = latestById.get(memory.id);
+      const vector = embedded.get(memory.id) ?? (current?.fingerprint === fingerprint(memory) ? current.vector : undefined);
+      if (!vector) throw new Error(`Missing embedding for accepted memory ${memory.id}`);
+      if (dimensions !== undefined && vector.length !== dimensions) throw new Error("Embedding dimensions do not match the index");
+      records.push({ id: memory.id, fingerprint: fingerprint(memory), vector });
+    }
+    const result: VectorIndexFile = {
+      version: 1,
+      spaceId: space.id,
+      provider: provider.name,
+      model: provider.modelId,
+      dimensions: dimensions ?? 0,
+      updatedAt: new Date().toISOString(),
+      records,
+    };
+    await writeVectorIndex(space, result);
+    return result;
+  });
+}
+
+function cosineSimilarity(left: readonly number[], right: readonly number[]): number {
+  if (left.length !== right.length || left.length === 0) return -1;
+  let score = 0;
+  for (let index = 0; index < left.length; index++) score += left[index] * right[index];
+  return Number.isFinite(score) ? score : -1;
+}
+
+interface SemanticResult {
+  memory: AcceptedMemory;
+  score: number;
+}
+
+async function semanticSearch(space: SpaceDefinition, memories: readonly AcceptedMemory[], query: string, provider: EmbeddingProvider): Promise<SemanticResult[]> {
+  if (memories.length === 0 || !query.trim()) return [];
+  const index = await ensureVectorIndex(space, memories, provider);
+  const queryVectors = await provider.embed([query]);
+  const queryVector = normalizeVector(queryVectors[0]);
+  const byId = new Map(memories.map((memory) => [memory.id, memory]));
+  return index.records
+    .map((record) => ({ memory: byId.get(record.id), score: cosineSimilarity(queryVector, record.vector) }))
+    .filter((result): result is SemanticResult => Boolean(result.memory) && result.score > -1)
+    .sort((a, b) => b.score - a.score || b.memory.createdAt.localeCompare(a.memory.createdAt) || a.memory.id.localeCompare(b.memory.id))
+    .slice(0, MAX_SEMANTIC_CANDIDATES);
+}
+
+class OptionalTransformersEmbeddingProvider implements EmbeddingProvider {
+  readonly name = "transformers.js";
+  readonly modelId: string;
+  private pipelinePromise?: Promise<(texts: string | string[], options: Record<string, unknown>) => Promise<unknown>>;
+
+  constructor(modelId: string) {
+    this.modelId = modelId;
+  }
+
+  private async getPipeline(): Promise<(texts: string | string[], options: Record<string, unknown>) => Promise<unknown>> {
+    if (!this.pipelinePromise) {
+      this.pipelinePromise = (async () => {
+        let module: { pipeline?: (task: string, model: string) => Promise<unknown> };
+        try {
+          const dynamicImport = Function("specifier", "return import(specifier)") as (specifier: string) => Promise<typeof module>;
+          module = await dynamicImport("@huggingface/transformers");
+        } catch {
+          throw new Error("Optional @huggingface/transformers package is not installed");
+        }
+        if (typeof module.pipeline !== "function") throw new Error("Optional Transformers.js package has no pipeline export");
+        const extractor = await module.pipeline("feature-extraction", this.modelId);
+        if (typeof extractor !== "function") throw new Error("Transformers.js did not create a feature-extraction pipeline");
+        return extractor as (texts: string | string[], options: Record<string, unknown>) => Promise<unknown>;
+      })();
+    }
+    return this.pipelinePromise;
+  }
+
+  async embed(texts: readonly string[]): Promise<readonly (readonly number[])[]> {
+    if (texts.length === 0) return [];
+    const extractor = await this.getPipeline();
+    const output = await extractor(texts.length === 1 ? texts[0] : [...texts], { pooling: "mean", normalize: true });
+    return readTransformerEmbeddings(output, texts.length);
+  }
+}
+
+function readTransformerEmbeddings(output: unknown, count: number): number[][] {
+  if (!output || typeof output !== "object") throw new Error("Embedding provider returned no tensor");
+  const value = output as { tolist?: () => unknown; data?: ArrayLike<number>; dims?: readonly number[] };
+  if (typeof value.tolist === "function") {
+    const listed = value.tolist();
+    if (Array.isArray(listed) && listed.every((item) => Array.isArray(item))) {
+      const vectors = listed.map((item) => normalizeVector(item as number[]));
+      if (vectors.length === count) return vectors;
+    }
+    if (count === 1 && Array.isArray(listed) && listed.every((item) => typeof item === "number")) return [normalizeVector(listed as number[])];
+  }
+  if (!value.data || !value.dims || value.dims.length < 1) throw new Error("Embedding provider returned an unreadable tensor");
+  const data = Array.from(value.data);
+  const dimensions = value.dims.length >= 2 ? value.dims[value.dims.length - 1] : data.length / count;
+  if (!Number.isInteger(dimensions) || dimensions <= 0 || data.length !== dimensions * count) throw new Error("Embedding provider returned invalid tensor dimensions");
+  return Array.from({ length: count }, (_, index) => normalizeVector(data.slice(index * dimensions, (index + 1) * dimensions)));
+}
+
+let optionalProvider: OptionalTransformersEmbeddingProvider | undefined;
+
+function defaultEmbeddingProvider(model: string): EmbeddingProvider {
+  if (!optionalProvider || optionalProvider.modelId !== model) optionalProvider = new OptionalTransformersEmbeddingProvider(model);
+  return optionalProvider;
+}
+
+function rankById(results: readonly RetrievalResult[] | readonly SemanticResult[]): Map<string, { memory: AcceptedMemory; rank: number }> {
+  return new Map(results.map((result, index) => [`${result.memory.spaceId}:${result.memory.id}`, { memory: result.memory, rank: index + 1 }]));
+}
+
+export class HybridRetrievalBackend implements RetrievalBackend {
+  readonly name = "hybrid-rrf (Transformers.js; lexical fallback)";
+  private readonly lexical: LexicalRetrievalBackend;
+  private readonly provider: EmbeddingProvider;
+  private readonly rrfK: number;
+
+  constructor(provider: EmbeddingProvider, rrfK = DEFAULT_RRF_K, lexical = new LexicalRetrievalBackend()) {
+    this.provider = provider;
+    this.rrfK = Math.max(1, Math.floor(rrfK));
+    this.lexical = lexical;
+  }
+
+  async search(spaces: readonly SpaceDefinition[], query: string, limit: number): Promise<RetrievalResult[]> {
+    const boundedLimit = Math.max(1, limit);
+    const lexicalResults = await this.lexical.search(spaces, query, Math.max(boundedLimit * 4, 20));
+    const semanticResults: SemanticResult[] = [];
+    try {
+      for (const space of spaces) {
+        const memories = await readAcceptedMemories(space);
+        semanticResults.push(...await semanticSearch(space, memories, query, this.provider));
+      }
+    } catch {
+      // Optional provider, model download, runtime, network, or index
+      // corruption must never prevent lexical recall.
+      return lexicalResults.slice(0, boundedLimit);
+    }
+
+    const lexicalRanks = rankById(lexicalResults);
+    const semanticRanks = rankById(semanticResults);
+    const allKeys = new Set([...lexicalRanks.keys(), ...semanticRanks.keys()]);
+    const fused: RetrievalResult[] = [];
+    for (const key of allKeys) {
+      const lexical = lexicalRanks.get(key);
+      const semantic = semanticRanks.get(key);
+      const memory = lexical?.memory ?? semantic?.memory;
+      if (!memory) continue;
+      const score = (lexical ? 1 / (this.rrfK + lexical.rank) : 0) + (semantic ? 1 / (this.rrfK + semantic.rank) : 0);
+      fused.push({ memory, score });
+    }
+    return fused
+      .sort((a, b) => b.score - a.score || b.memory.createdAt.localeCompare(a.memory.createdAt) || a.memory.id.localeCompare(b.memory.id))
+      .slice(0, boundedLimit);
+  }
+}
+
+export function createRetrievalBackend(options: RetrievalBackendOptions = {}): RetrievalBackend {
+  const mode = options.mode ?? "auto";
+  if (mode === "lexical") return new LexicalRetrievalBackend();
+  return new HybridRetrievalBackend(
+    options.embeddingProvider ?? defaultEmbeddingProvider(options.model ?? DEFAULT_EMBEDDING_MODEL),
+    options.rrfK ?? DEFAULT_RRF_K,
+  );
+}
+
+/** Optional feature detection for environments that want to inspect LanceDB. */
 export async function hasOptionalLanceDb(): Promise<boolean> {
   try {
     const dynamicImport = Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
-    await dynamicImport("lancedb");
+    await dynamicImport("@lancedb/lancedb");
     return true;
   } catch {
     return false;
   }
 }
-
-export function createRetrievalBackend(): RetrievalBackend {
-  return new LexicalRetrievalBackend();
-}
-

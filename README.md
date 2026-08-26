@@ -56,6 +56,15 @@ pi install /Users/jimmy/coding/pi-obsidian-live
 For a global install from a published package or Git repository, use the
 corresponding `npm:` or `git:` source. Then run `/reload` in Pi (or restart Pi).
 
+Hybrid retrieval is an optional runtime enhancement. The package itself has no
+mandatory vector/native dependency, so a fresh install works with BM25. To
+enable the local open-source embedding provider, install the optional peer in
+the package directory:
+
+```bash
+npm install @huggingface/transformers
+```
+
 The old `~/.pi/agent/oblive.json` and `OBLIVE_*` configuration remain
 compatible. The package entry point is still `obsidian-live.ts`, so existing
 `/oblive` behavior is preserved.
@@ -176,13 +185,20 @@ Obsidian live view. Add an optional `~/.pi/agent/pi-live.json`:
     "maxPromptChars": 6000,
     "jobLeaseMs": 90000,
     "maxJobAttempts": 3,
-    "shutdownTimeoutMs": 1500
+    "shutdownTimeoutMs": 1500,
+    "retrieval": {
+      "mode": "auto",
+      "model": "onnx-community/all-MiniLM-L6-v2-ONNX",
+      "rrfK": 60
+    }
   }
 }
 ```
 
 `PILIVE_DATA_ROOT` and `PILIVE_MEMORY_MODE` (`off`, `read`, `read-write`, or
-`on`) are optional launch-time overrides. The default data root is:
+`on`) are optional launch-time overrides. Retrieval can also be controlled with
+`PILIVE_RETRIEVAL_MODE` (`auto`, `lexical`, or `hybrid`) and
+`PILIVE_EMBEDDING_MODEL`. The default data root is:
 
 ```text
 ~/.pi/agent/pi-live-data/
@@ -192,7 +208,7 @@ Obsidian live view. Add an optional `~/.pi/agent/pi-live.json`:
     ├── rejected/    # explicitly rejected candidates with provenance
     ├── memories/    # accepted memory records used for recall
     ├── jobs/        # durable extraction queue and retry state
-    └── index/       # derived retrieval metadata
+    └── index/       # derived per-Space vector index (safe to delete/rebuild)
 ```
 
 `/space new <name>` creates a Space at `dataRoot/spaces/<id>`. Space names keep
@@ -219,7 +235,7 @@ candidate in Space/inbox
     ↓ /memory accept <id>
 accepted record in Space/memories
     ↓ next before_agent_start
-bounded lexical recall for the mounted Space only
+bounded BM25 + optional semantic recall for the mounted Space only
 ```
 
 Automatic extraction can be disabled with `autoCapture: false`; `/memory capture`
@@ -227,10 +243,27 @@ still runs immediately. Jobs use an expiring cross-process lease,
 heartbeat renewal, exponential retry delay, and a maximum attempt count.
 Shutdown aborts the request and waits only for the configured bounded timeout;
 an unfinished lease is recovered later as stale. Candidates are never injected
-into context until explicitly accepted. V1 intentionally implements only a
-deterministic local lexical backend behind a retrieval interface. Hybrid/vector
-retrieval (including LanceDB) is not implemented yet and is not required for
-the current fallback.
+into context until explicitly accepted.
+
+### Hybrid retrieval
+
+The default `auto` mode always starts safely: if the optional
+`@huggingface/transformers` package or its model is unavailable, retrieval is
+quietly BM25-only. When the optional provider is available, accepted memories
+are embedded with the configured Transformers.js feature-extraction model and
+stored in `Space/index/vectors.json`. The index contains only memory IDs,
+content fingerprints, and normalized vectors; accepted memory JSON remains the
+source of truth.
+
+Each Learning Space has an independent index. New or changed accepted records
+are embedded incrementally, deleted records are pruned, and a missing or
+malformed index is rebuilt automatically. BM25 and semantic rankings are fused
+with Reciprocal Rank Fusion (`rrfK`, default `60`). Provider errors, model
+download failures, invalid vectors, dimension changes, permissions errors, and
+corrupt index files all return the lexical result set without blocking the
+agent turn. Set `mode` to `lexical` to disable the optional provider entirely;
+set it to `hybrid` to request semantic retrieval explicitly while retaining the
+same lexical fallback.
 
 ## File format
 
@@ -334,7 +367,7 @@ per launch, or `/oblive repair off` at runtime.
 | Space state | Session custom entries on the active branch; `/space use` and `/space off` survive resume/fork/tree navigation correctly |
 | Memory state | JSON records and durable jobs under the configured data root; accepted records are the only recall source |
 | Background work | Idle/debounce scheduling, expiring leases, bounded retries, abortable model requests, and bounded shutdown wait |
-| Retrieval | Deterministic lexical backend behind an extension point; hybrid/vector retrieval is explicitly not implemented in V1 |
+| Retrieval | BM25 lexical ranking plus optional Transformers.js vectors, per-Space incremental JSON indexes, RRF fusion, and silent lexical fallback |
 
 ## License
 

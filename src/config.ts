@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export type MemoryMode = "off" | "read" | "read-write";
+export type RetrievalMode = "auto" | "lexical" | "hybrid";
 
 export interface PiLiveConfig {
   dataRoot?: string;
@@ -16,6 +17,11 @@ export interface PiLiveConfig {
     jobLeaseMs?: number;
     maxJobAttempts?: number;
     shutdownTimeoutMs?: number;
+    retrieval?: {
+      mode?: RetrievalMode;
+      model?: string;
+      rrfK?: number;
+    };
   };
 }
 
@@ -34,6 +40,10 @@ export function defaultDataRoot(): string {
 
 function isMemoryMode(value: unknown): value is MemoryMode {
   return value === "off" || value === "read" || value === "read-write";
+}
+
+function isRetrievalMode(value: unknown): value is RetrievalMode {
+  return value === "auto" || value === "lexical" || value === "hybrid";
 }
 
 export function parsePiLiveConfig(raw: string): PiLiveConfig {
@@ -68,6 +78,18 @@ export function parsePiLiveConfig(raw: string): PiLiveConfig {
     if (typeof memory.shutdownTimeoutMs === "number" && Number.isInteger(memory.shutdownTimeoutMs) && memory.shutdownTimeoutMs >= 100) {
       parsed.shutdownTimeoutMs = Math.min(memory.shutdownTimeoutMs, 10000);
     }
+    if (memory.retrieval && typeof memory.retrieval === "object") {
+      const retrieval = memory.retrieval as Record<string, unknown>;
+      const parsedRetrieval: NonNullable<PiLiveConfig["memory"]>["retrieval"] = {};
+      if (isRetrievalMode(retrieval.mode)) parsedRetrieval.mode = retrieval.mode;
+      if (typeof retrieval.model === "string" && retrieval.model.trim()) {
+        parsedRetrieval.model = retrieval.model.trim().slice(0, 200);
+      }
+      if (typeof retrieval.rrfK === "number" && Number.isInteger(retrieval.rrfK) && retrieval.rrfK >= 1) {
+        parsedRetrieval.rrfK = Math.min(retrieval.rrfK, 200);
+      }
+      parsed.retrieval = parsedRetrieval;
+    }
     result.memory = parsed;
   }
   return result;
@@ -95,4 +117,16 @@ export function effectiveMemoryMode(config: PiLiveConfig, env: NodeJS.ProcessEnv
   if (raw === "off" || raw === "read" || raw === "read-write") return raw;
   if (raw === "on") return "read-write";
   return config.memory?.mode ?? "off";
+}
+
+export function effectiveRetrievalMode(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): RetrievalMode {
+  const raw = env.PILIVE_RETRIEVAL_MODE?.trim().toLowerCase();
+  if (raw === "auto" || raw === "lexical" || raw === "hybrid") return raw;
+  return config.memory?.retrieval?.mode ?? "auto";
+}
+
+export const DEFAULT_EMBEDDING_MODEL = "onnx-community/all-MiniLM-L6-v2-ONNX";
+
+export function effectiveEmbeddingModel(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): string {
+  return env.PILIVE_EMBEDDING_MODEL?.trim() || config.memory?.retrieval?.model || DEFAULT_EMBEDDING_MODEL;
 }

@@ -4,7 +4,7 @@ import { basename, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Context, Message } from "@earendil-works/pi-ai";
-import { effectiveDataRoot, effectiveMemoryMode, type MemoryMode, readPiLiveConfig, type PiLiveConfig, resolvePath } from "./config.js";
+import { effectiveDataRoot, effectiveEmbeddingModel, effectiveMemoryMode, effectiveRetrievalMode, type MemoryMode, readPiLiveConfig, type PiLiveConfig, resolvePath } from "./config.js";
 import { createRetrievalBackend, type MemoryProvenance } from "./retrieval.js";
 import { createSpace, ensureSpaceDirs, getSpace, listSpaces, normalizeSpaceId, readActiveSpaceId, SPACE_ENTRY_TYPE, type SpaceDefinition, type SpaceSessionAction } from "./space.js";
 import { atomicWrite, enqueueSpaceWrite } from "./storage.js";
@@ -21,6 +21,14 @@ export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1500;
 const DEFAULT_RETRY_BACKOFF_MS = 30 * 1000;
 const MAX_RETRY_BACKOFF_MS = 15 * 60 * 1000;
 const MAX_REVIEW_TEXT_CHARS = 180;
+
+function retrievalBackendFor(config: PiLiveConfig) {
+  return createRetrievalBackend({
+    mode: effectiveRetrievalMode(config),
+    model: effectiveEmbeddingModel(config),
+    rrfK: config.memory?.retrieval?.rrfK,
+  });
+}
 
 export interface MemoryCandidate extends MemoryProvenance {
   id: string;
@@ -645,7 +653,7 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
       const space = await getSpace(state.dataRoot, state.activeSpaceId);
       if (!space) return;
       const limit = state.config.memory?.retrievalLimit ?? DEFAULT_RETRIEVAL_LIMIT;
-      const results = await createRetrievalBackend().search([space], event.prompt, limit).catch(() => []);
+      const results = await retrievalBackendFor(state.config).search([space], event.prompt, limit).catch(() => []);
       if (results.length === 0) return;
       const maxChars = state.config.memory?.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS;
       let used = 0;
@@ -765,7 +773,7 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
         if (action === "status") {
           const space = state.activeSpaceId ? await getSpace(state.dataRoot, state.activeSpaceId) : undefined;
           const jobs = space ? await readJobs(space) : [];
-          notify(ctx, `Pi Live Memory: ${memoryModeLabel(state.mode)}\nSpace: ${space?.id ?? "OFF"}\nPending jobs: ${jobs.length}\nBackend: lexical`, "info");
+          notify(ctx, `Pi Live Memory: ${memoryModeLabel(state.mode)}\nSpace: ${space?.id ?? "OFF"}\nPending jobs: ${jobs.length}\nBackend: ${retrievalBackendFor(state.config).name}`, "info");
           return;
         }
         if (action === "off" || action === "read" || action === "on") {
