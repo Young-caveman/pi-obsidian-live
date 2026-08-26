@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
-import type { RetrievalMode } from "./config.js";
-import { DEFAULT_EMBEDDING_MODEL, resolvePath } from "./config.js";
+import type { EmbeddingProviderKind, RetrievalMode } from "./config.js";
+import { DEFAULT_EMBEDDING_MODEL, DEFAULT_OPENROUTER_EMBEDDING_MODEL, resolvePath } from "./config.js";
 import { atomicWrite, enqueueSpaceWrite } from "./storage.js";
 import type { SpaceDefinition } from "./space.js";
 
@@ -44,6 +44,9 @@ export interface RetrievalBackendOptions {
   model?: string;
   rrfK?: number;
   embeddingProvider?: EmbeddingProvider;
+  providerKind?: EmbeddingProviderKind;
+  /** OpenRouter credential; usually resolved from OPENROUTER_API_KEY by the caller. */
+  embeddingApiKey?: string;
 }
 
 const DEFAULT_RRF_K = 60;
@@ -367,18 +370,112 @@ function defaultEmbeddingProvider(model: string): EmbeddingProvider {
   return optionalProvider;
 }
 
+const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
+const OPENROUTER_EMBED_TIMEOUT_MS = 30 * 1000;
+const OPENROUTER_ERROR_SNIPPET_CHARS = 300;
+
+export interface OpenRouterEmbeddingOptions {
+  model: string;
+  apiKey?: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+}
+
+/**
+ * Remote embeddings through the OpenAI-compatible OpenRouter endpoint
+ * `POST /v1/embeddings`. Missing credentials or request failures throw so the
+ * hybrid backend can fall back to lexical recall, matching the optional local
+ * provider's contract.
+ */
+export class OpenRouterEmbeddingProvider implements EmbeddingProvider {
+  readonly name = "openrouter";
+  readonly modelId: string;
+  private readonly apiKey: string | undefined;
+  private readonly baseUrl: string;
+  private readonly timeoutMs: number;
+
+  constructor(options: OpenRouterEmbeddingOptions) {
+    this.modelId = options.model;
+    this.apiKey = options.apiKey?.trim() || undefined;
+    this.baseUrl = (options.baseUrl?.trim() || OPENROUTER_DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.timeoutMs = Math.max(1000, options.timeoutMs ?? OPENROUTER_EMBED_TIMEOUT_MS);
+  }
+
+  async embed(texts: readonly string[]): Promise<readonly (readonly number[])[]> {
+    if (texts.length === 0) return [];
+    if (!this.apiKey) {
+      throw new Error("OpenRouter embeddings need an API key: set OPENROUTER_API_KEY or memory.retrieval.apiKey");
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    timer.unref?.();
+    try {
+      const response = await fetch(`${this.baseUrl}/embeddings`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: this.modelId,
+          input: texts.length === 1 ? texts[0] : [...texts],
+          encoding_format: "float",
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = (await response.text().catch(() => "")).slice(0, OPENROUTER_ERROR_SNIPPET_CHARS);
+        throw new Error(`OpenRouter embeddings request failed with status ${response.status}${detail ? `: ${detail}` : ""}`);
+      }
+      return parseOpenRouterEmbeddings(await response.json(), texts.length);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function requireFiniteVector(value: unknown): number[] {
+  if (!Array.isArray(value) || value.length === 0 || !value.every((item) => typeof item === "number" && Number.isFinite(item))) {
+    throw new Error("OpenRouter returned an invalid embedding vector");
+  }
+  return value as number[];
+}
+
+/** Validate an OpenRouter embeddings payload and restore the request order via each entry's index. */
+export function parseOpenRouterEmbeddings(payload: unknown, count: number): number[][] {
+  if (!payload || typeof payload !== "object") throw new Error("OpenRouter returned an unreadable embeddings response");
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data) || data.length !== count) {
+    throw new Error(`OpenRouter embeddings response has the wrong batch size (expected ${count})`);
+  }
+  const entries = data.map((entry) => {
+    if (!entry || typeof entry !== "object") throw new Error("OpenRouter embeddings response has a malformed entry");
+    return entry as { index?: unknown; embedding?: unknown };
+  });
+  const indexed = entries.every((entry) => typeof entry.index === "number" && Number.isInteger(entry.index));
+  const vectors = new Array<number[]>(count);
+  for (let position = 0; position < entries.length; position++) {
+    const entry = entries[position]!;
+    const slot = indexed ? (entry.index as number) : position;
+    if (slot < 0 || slot >= count || vectors[slot]) throw new Error("OpenRouter embeddings response indices are invalid");
+    vectors[slot] = requireFiniteVector(entry.embedding);
+  }
+  return vectors;
+}
+
 function rankById(results: readonly RetrievalResult[] | readonly SemanticResult[]): Map<string, { memory: AcceptedMemory; rank: number }> {
   return new Map(results.map((result, index) => [`${result.memory.spaceId}:${result.memory.id}`, { memory: result.memory, rank: index + 1 }]));
 }
 
 export class HybridRetrievalBackend implements RetrievalBackend {
-  readonly name = "hybrid-rrf (Transformers.js; lexical fallback)";
+  readonly name: string;
   private readonly lexical: LexicalRetrievalBackend;
   private readonly provider: EmbeddingProvider;
   private readonly rrfK: number;
 
   constructor(provider: EmbeddingProvider, rrfK = DEFAULT_RRF_K, lexical = new LexicalRetrievalBackend()) {
     this.provider = provider;
+    this.name = `hybrid-rrf (${provider.name}; lexical fallback)`;
     this.rrfK = Math.max(1, Math.floor(rrfK));
     this.lexical = lexical;
   }
@@ -419,10 +516,14 @@ export class HybridRetrievalBackend implements RetrievalBackend {
 export function createRetrievalBackend(options: RetrievalBackendOptions = {}): RetrievalBackend {
   const mode = options.mode ?? "auto";
   if (mode === "lexical") return new LexicalRetrievalBackend();
-  return new HybridRetrievalBackend(
-    options.embeddingProvider ?? defaultEmbeddingProvider(options.model ?? DEFAULT_EMBEDDING_MODEL),
-    options.rrfK ?? DEFAULT_RRF_K,
-  );
+  const kind = options.providerKind ?? "local";
+  const provider = options.embeddingProvider ?? (kind === "openrouter"
+    ? new OpenRouterEmbeddingProvider({
+        model: options.model ?? DEFAULT_OPENROUTER_EMBEDDING_MODEL,
+        apiKey: options.embeddingApiKey,
+      })
+    : defaultEmbeddingProvider(options.model ?? DEFAULT_EMBEDDING_MODEL));
+  return new HybridRetrievalBackend(provider, options.rrfK ?? DEFAULT_RRF_K);
 }
 
 /** Optional feature detection for environments that want to inspect LanceDB. */
