@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { effectiveDataRoot, effectiveEmbeddingModel, effectiveMemoryMode, effectiveRetrievalMode, parsePiLiveConfig, resolvePath } from "./config.js";
+import { effectiveAutoAcceptMinConfidence, effectiveDataRoot, effectiveEmbeddingModel, effectiveMemoryMode, effectiveRetrievalMode, parsePiLiveConfig, resolvePath } from "./config.js";
 
 describe("Pi Live config", () => {
   it("parses data root and memory settings safely", () => {
     const config = parsePiLiveConfig(JSON.stringify({
       dataRoot: "~/pi-data",
-      memory: { mode: "read-write", autoCapture: true, captureIdleMs: 120000, minTextChars: 100, retrievalLimit: 4, maxJobAttempts: 3, retrieval: { mode: "hybrid", model: "local/model", rrfK: 42 } },
+      memory: { mode: "read-write", autoCapture: true, captureIdleMs: 120000, minTextChars: 100, retrievalLimit: 4, maxJobAttempts: 3, autoAcceptMinConfidence: 0.9, retrieval: { mode: "hybrid", model: "local/model", rrfK: 42 } },
     }));
+    expect(config.memory?.autoAcceptMinConfidence).toBe(0.9);
+    expect(effectiveAutoAcceptMinConfidence(config, {})).toBe(0.9);
+    expect(effectiveAutoAcceptMinConfidence(config, { PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE: "0.5" })).toBe(0.5);
+    expect(effectiveAutoAcceptMinConfidence(config, { PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE: "bad" })).toBe(0.9);
+    expect(effectiveAutoAcceptMinConfidence(parsePiLiveConfig("{}"), {})).toBeUndefined();
+    expect(parsePiLiveConfig(JSON.stringify({ memory: { autoAcceptMinConfidence: 1.5 } })).memory?.autoAcceptMinConfidence).toBeUndefined();
     expect(effectiveDataRoot(config, {})).toBe(resolvePath("~/pi-data"));
     expect(effectiveMemoryMode(config, {})).toBe("read-write");
     expect(config.memory?.captureIdleMs).toBe(120000);

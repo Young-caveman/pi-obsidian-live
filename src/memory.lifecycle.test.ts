@@ -26,6 +26,7 @@ interface Runtime {
 const cleanup: string[] = [];
 const originalDataRoot = process.env.PILIVE_DATA_ROOT;
 const originalMemoryMode = process.env.PILIVE_MEMORY_MODE;
+const originalAutoAccept = process.env.PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE;
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -33,6 +34,8 @@ afterEach(async () => {
   else process.env.PILIVE_DATA_ROOT = originalDataRoot;
   if (originalMemoryMode === undefined) delete process.env.PILIVE_MEMORY_MODE;
   else process.env.PILIVE_MEMORY_MODE = originalMemoryMode;
+  if (originalAutoAccept === undefined) delete process.env.PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE;
+  else process.env.PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE = originalAutoAccept;
   await Promise.all(cleanup.splice(0).map((path) => fs.rm(path, { recursive: true, force: true })));
 });
 
@@ -240,6 +243,65 @@ describe("Memory lifecycle", () => {
     const result = await emit(runtime, "before_agent_start", { prompt: "second memory", systemPrompt: "base" }) as { systemPrompt?: string } | undefined;
     expect(result?.systemPrompt).toContain("project-b");
     expect(result?.systemPrompt).not.toContain("project-a");
+  });
+
+  it("shows memory counts in space and memory status", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "pi-live-memory-counts-"));
+    cleanup.push(root);
+    process.env.PILIVE_DATA_ROOT = root;
+    process.env.PILIVE_MEMORY_MODE = "read-write";
+    const space = await createSpace(root, "counts");
+    await atomicWrite(join(space.path, "memories", "one.json"), JSON.stringify({
+      id: "one", status: "accepted", spaceId: space.id, projectId: "project", sessionId: "session",
+      source: "x", kind: "semantic", confidence: 0.9, createdAt: "2026-01-01T00:00:00Z", text: "accepted memory one",
+    }));
+    await atomicWrite(join(space.path, "inbox", "pending.json"), JSON.stringify({
+      id: "pending", status: "candidate", spaceId: space.id, projectId: "project", sessionId: "session",
+      source: "x", kind: "semantic", confidence: 0.9, createdAt: "2026-01-01T00:00:00Z", text: "waiting candidate",
+    }));
+    const runtime = makeRuntime(root, space.id, async () => ({ content: [{ type: "text", text: "[]" }] }));
+    await emit(runtime, "session_start");
+
+    await runtime.commands.get("space")!.handler("status", runtime.ctx);
+    expect(runtime.notifications.at(-1)).toContain("Memories: 1 accepted · 1 candidates · 0 rejected");
+    await runtime.commands.get("memory")!.handler("status", runtime.ctx);
+    expect(runtime.notifications.at(-1)).toContain("Memories: 1 accepted · 1 candidates · 0 rejected");
+    await runtime.commands.get("space")!.handler("list", runtime.ctx);
+    expect(runtime.notifications.at(-1)).toContain("counts — 1 memories");
+  });
+
+  it("accepts candidates in batch and auto-accepts high-confidence ones by threshold", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "pi-live-memory-autogate-"));
+    cleanup.push(root);
+    process.env.PILIVE_DATA_ROOT = root;
+    process.env.PILIVE_MEMORY_MODE = "read-write";
+    process.env.PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE = "0.85";
+    const space = await createSpace(root, "gated");
+    const runtime = makeRuntime(root, space.id, async () => ({
+      content: [{ type: "text", text: JSON.stringify([
+        { text: "A high-confidence durable fact about distributed consensus.", kind: "semantic", confidence: 0.95 },
+        { text: "A lower-confidence preference that still needs human review.", kind: "preference", confidence: 0.6 },
+      ]) }],
+    }));
+    await emit(runtime, "session_start");
+    await runtime.commands.get("memory")!.handler("capture", runtime.ctx);
+    // High-confidence item skipped the inbox and went straight to memories.
+    const inboxNames = (await fs.readdir(join(space.path, "inbox"))).filter((name) => name.endsWith(".json"));
+    const memoryNames = (await fs.readdir(join(space.path, "memories"))).filter((name) => name.endsWith(".json"));
+    expect(inboxNames).toHaveLength(1);
+    expect(memoryNames).toHaveLength(1);
+    expect(runtime.notifications.at(-1)).toContain("auto-accepted 1");
+    const autoAccepted = await readJson<{ status: string; confidence: number }>(join(space.path, "memories", memoryNames[0]!));
+    expect(autoAccepted.status).toBe("accepted");
+    expect(autoAccepted.confidence).toBe(0.95);
+
+    // Batch accept moves the remaining lower-confidence candidate too.
+    const lowId = inboxNames[0]!.replace(/\.json$/, "");
+    await runtime.commands.get("memory")!.handler(`accept ${lowId} missing-id`, runtime.ctx);
+    expect(runtime.notifications.at(-1)).toContain("accepted 1");
+    expect(runtime.notifications.at(-1)).toContain("missing-id failed: Candidate not found");
+    expect((await fs.readdir(join(space.path, "inbox")))).toHaveLength(0);
+    expect((await fs.readdir(join(space.path, "memories")))).toHaveLength(2);
   });
 
   it("quarantines malformed queue records without blocking status", async () => {

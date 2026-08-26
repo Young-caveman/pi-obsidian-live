@@ -4,7 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Context, Message } from "@earendil-works/pi-ai";
-import { effectiveDataRoot, effectiveEmbeddingModel, effectiveMemoryMode, effectiveRetrievalMode, type MemoryMode, readPiLiveConfig, type PiLiveConfig, resolvePath } from "./config.js";
+import { DEFAULT_OPENROUTER_EMBEDDING_MODEL, effectiveAutoAcceptMinConfidence, effectiveDataRoot, effectiveEmbeddingApiKey, effectiveEmbeddingProviderKind, effectiveMemoryMode, effectiveOptionalEmbeddingModel, effectiveRetrievalMode, embeddingModelLabel, type MemoryMode, readPiLiveConfig, type PiLiveConfig, resolvePath } from "./config.js";
 import { createRetrievalBackend, type MemoryProvenance } from "./retrieval.js";
 import { createSpace, ensureSpaceDirs, getSpace, listSpaces, normalizeSpaceId, readActiveSpaceId, SPACE_ENTRY_TYPE, type SpaceDefinition, type SpaceSessionAction } from "./space.js";
 import { atomicWrite, enqueueSpaceWrite } from "./storage.js";
@@ -25,8 +25,10 @@ const MAX_REVIEW_TEXT_CHARS = 180;
 function retrievalBackendFor(config: PiLiveConfig) {
   return createRetrievalBackend({
     mode: effectiveRetrievalMode(config),
-    model: effectiveEmbeddingModel(config),
+    model: effectiveOptionalEmbeddingModel(config),
     rrfK: config.memory?.retrieval?.rrfK,
+    providerKind: effectiveEmbeddingProviderKind(config),
+    embeddingApiKey: effectiveEmbeddingApiKey(config),
   });
 }
 
@@ -497,10 +499,13 @@ async function completeJob(
   job: MemoryJob,
   owner: string,
   extracted: Array<Pick<MemoryCandidate, "text" | "kind" | "confidence">>,
-): Promise<boolean> {
+  autoAcceptThreshold?: number,
+): Promise<{ candidates: number; autoAccepted: number }> {
   return enqueueSpaceWrite(space.path, async () => {
     const current = await readJob(space, job.id);
-    if (!current || current.status !== "running" || current.lease?.owner !== owner) return false;
+    if (!current || current.status !== "running" || current.lease?.owner !== owner) return { candidates: 0, autoAccepted: 0 };
+    let candidates = 0;
+    let autoAccepted = 0;
     for (let index = 0; index < extracted.length; index++) {
       const item = extracted[index];
       const candidate: MemoryCandidate = {
@@ -515,14 +520,22 @@ async function completeJob(
         createdAt: now(),
         text: item.text,
       };
-      await atomicWrite(candidatePath(space, candidate.id), JSON.stringify(candidate, null, 2) + "\n");
+      if (autoAcceptThreshold !== undefined && item.confidence >= autoAcceptThreshold) {
+        // Opt-in gate: high-confidence candidates skip the inbox entirely and
+        // become accepted records directly, still with full provenance.
+        await atomicWrite(memoryPath(space, candidate.id), JSON.stringify({ ...candidate, status: "accepted" as const }, null, 2) + "\n");
+        autoAccepted += 1;
+      } else {
+        await atomicWrite(candidatePath(space, candidate.id), JSON.stringify(candidate, null, 2) + "\n");
+        candidates += 1;
+      }
     }
     current.status = "completed";
     current.lease = undefined;
     current.lastError = undefined;
     current.retryAt = undefined;
     await updateJob(space, current);
-    return true;
+    return { candidates, autoAccepted };
   });
 }
 
@@ -531,6 +544,7 @@ async function processJobs(ctx: ExtensionContext, state: SessionMemoryState, spa
   const owner = `${process.pid}:${randomUUID()}`;
   const leaseMs = state.config.memory?.jobLeaseMs ?? DEFAULT_JOB_LEASE_MS;
   const maxAttempts = state.config.memory?.maxJobAttempts ?? DEFAULT_MAX_JOB_ATTEMPTS;
+  const autoAcceptThreshold = effectiveAutoAcceptMinConfidence(state.config);
   for (;;) {
     if (signal.aborted) return;
     const job = await claimNextJob(space, owner, leaseMs, maxAttempts, (message) => notify(ctx, message, "warning"));
@@ -539,7 +553,7 @@ async function processJobs(ctx: ExtensionContext, state: SessionMemoryState, spa
     try {
       const extracted = await completeExtraction(ctx, job, signal);
       if (signal.aborted) return;
-      await completeJob(space, job, owner, extracted);
+      await completeJob(space, job, owner, extracted, autoAcceptThreshold);
     } catch (error) {
       if (signal.aborted) return;
       await markJobFailed(space, job, owner, error, maxAttempts);
@@ -750,13 +764,46 @@ function memoryModeLabel(mode: MemoryMode): string {
   return mode === "read-write" ? "read-write" : mode;
 }
 
+async function countJsonFiles(dir: string): Promise<number> {
+  try {
+    return (await fs.readdir(dir)).filter((name) => name.endsWith(".json")).length;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+/** Count records of one job inside a Space subdirectory (inbox or memories). */
+async function countJobRecords(space: SpaceDefinition, jobId: string, subdir: "inbox" | "memories"): Promise<number> {
+  try {
+    return (await fs.readdir(join(resolvePath(space.path), subdir))).filter((name) => name.endsWith(".json") && name.startsWith(`mem-${jobId}-`)).length;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+async function spaceMemoryCounts(space: SpaceDefinition | undefined): Promise<{ memories: number; candidates: number; rejected: number }> {
+  if (!space) return { memories: 0, candidates: 0, rejected: 0 };
+  const base = resolvePath(space.path);
+  return {
+    memories: await countJsonFiles(join(base, "memories")),
+    candidates: await countJsonFiles(join(base, "inbox")),
+    rejected: await countJsonFiles(join(base, "rejected")),
+  };
+}
+
 async function showSpaceList(ctx: ExtensionContext, state: SessionMemoryState): Promise<void> {
   const spaces = await listSpaces(state.dataRoot, (message) => notify(ctx, message, "warning"));
   if (spaces.length === 0) {
     notify(ctx, `Pi Live Spaces: none\nData root: ${state.dataRoot}`, "info");
     return;
   }
-  notify(ctx, [`Pi Live Spaces (active marked *):`, ...spaces.map((space) => `${space.id}${space.id === state.activeSpaceId ? " *" : ""} — ${space.name} — ${space.path}`)].join("\n"), "info");
+  const lines = await Promise.all(spaces.map(async (space) => {
+    const counts = await spaceMemoryCounts(space);
+    return `${space.id}${space.id === state.activeSpaceId ? " *" : ""} — ${space.name} — ${space.path} — ${counts.memories} memories`;
+  }));
+  notify(ctx, [`Pi Live Spaces (active marked *):`, ...lines].join("\n"), "info");
 }
 
 export function registerMemoryFeatures(pi: ExtensionAPI): void {
@@ -884,7 +931,9 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
         }
         if (action === "status") {
           const space = state.activeSpaceId ? await getSpace(state.dataRoot, state.activeSpaceId, (message) => notify(ctx, message, "warning")) : undefined;
-          notify(ctx, `Pi Live Space: ${space ? `${space.id}\nPath: ${space.path}` : "OFF"}\nData root: ${state.dataRoot}`, "info");
+          const counts = await spaceMemoryCounts(space);
+          const memoryLine = space ? `\nMemories: ${counts.memories} accepted · ${counts.candidates} candidates · ${counts.rejected} rejected` : "";
+          notify(ctx, `Pi Live Space: ${space ? `${space.id}\nPath: ${space.path}${memoryLine}` : "OFF"}\nData root: ${state.dataRoot}`, "info");
           return;
         }
         throw new Error("Usage: /space list | new <name> [path] | use <name> | off | status");
@@ -904,8 +953,15 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
       try {
         if (action === "status") {
           const space = state.activeSpaceId ? await getSpace(state.dataRoot, state.activeSpaceId, (message) => notify(ctx, message, "warning")) : undefined;
+          const counts = await spaceMemoryCounts(space);
           const jobs = space ? await readJobs(space, (message) => notify(ctx, message, "warning")) : [];
-          notify(ctx, `Pi Live Memory: ${memoryModeLabel(state.mode)}\nSpace: ${space?.id ?? "OFF"}\nPending jobs: ${jobs.length}\nBackend: ${retrievalBackendFor(state.config).name}`, "info");
+          let status = `Pi Live Memory: ${memoryModeLabel(state.mode)}\nSpace: ${space?.id ?? "OFF"}`;
+          if (space) status += `\nMemories: ${counts.memories} accepted · ${counts.candidates} candidates · ${counts.rejected} rejected`;
+          status += `\nPending jobs: ${jobs.length}\nBackend: ${retrievalBackendFor(state.config).name}\nEmbedding model: ${embeddingModelLabel(state.config)}`;
+          if (effectiveEmbeddingProviderKind(state.config) === "openrouter" && !effectiveEmbeddingApiKey(state.config)) {
+            status += "\nWarning: OpenRouter provider selected but no API key found; recall falls back to BM25.";
+          }
+          notify(ctx, status, "info");
           return;
         }
         if (action === "off" || action === "read" || action === "on") {
@@ -930,18 +986,26 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
             notify(ctx, "Pi Live Memory: nothing captured (the visible turn is too short or no Space is mounted).", "info");
             return;
           }
+          const jobId = result.job.id;
           cancelAutoCapture(state);
           await scheduleProcessing(ctx, state, result.space);
-          const finalJob = await readJob(result.space, result.job.id);
+          const finalJob = await readJob(result.space, jobId);
           if (finalJob?.status === "failed" || finalJob?.status === "dead") {
             notify(
               ctx,
-              `Pi Live Memory: capture ${finalJob.status} for job ${result.job.id}${finalJob.lastError ? ` — ${finalJob.lastError}` : ""}. It will retry after the backoff window.`,
+              `Pi Live Memory: capture ${finalJob.status} for job ${jobId}${finalJob.lastError ? ` — ${finalJob.lastError}` : ""}. It will retry after the backoff window.`,
               "warning",
             );
             return;
           }
-          notify(ctx, `Pi Live Memory: capture processed into candidate/inbox (job ${result.job.id}). Use /memory review.`, "info");
+          const produced = (await readCandidates(result.space)).filter((candidate) => candidate.id.startsWith(`mem-${jobId}-`)).length;
+          const autoPromoted = await countJobRecords(result.space, jobId, "memories");
+          if (produced + autoPromoted === 0) {
+            notify(ctx, `Pi Live Memory: capture completed but extracted no durable memory (job ${jobId}). Try a turn with concrete concepts, procedures, or preferences — tool-related chat is filtered out by design.`, "info");
+            return;
+          }
+          const autoNote = autoPromoted > 0 ? ` and auto-accepted ${autoPromoted} (confidence threshold)` : "";
+          notify(ctx, `Pi Live Memory: capture processed ${produced} candidate(s) into inbox${autoNote} (job ${jobId}). Use /memory review.`, "info");
           return;
         }
         if (action === "review") {
@@ -958,29 +1022,45 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
           return;
         }
         if (action === "accept") {
-          if (!tokens[1]) throw new Error("Usage: /memory accept <candidate-id>");
+          if (!tokens[1]) throw new Error("Usage: /memory accept <candidate-id> [more ids...]");
           if (!state.activeSpaceId) throw new Error("No Space mounted");
           const space = await getSpace(state.dataRoot, state.activeSpaceId, (message) => notify(ctx, message, "warning"));
           if (!space) throw new Error(`Space not found: ${state.activeSpaceId}`);
-          const id = tokens[1].replace(/\.json$/, "");
-          if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error("Candidate id contains invalid path characters");
-          const source = candidatePath(space, id);
-          await enqueueSpaceWrite(space.path, async () => {
-            const candidate = await readJson<MemoryCandidate>(source);
-            const acceptedAlready = await readJson<{ id?: unknown; status?: unknown }>(memoryPath(space, id));
-            if (!candidateBelongsToSpace(candidate, space.id) || candidate.id !== id) {
-              if (acceptedAlready?.id === id && acceptedAlready.status === "accepted") return;
-              const rejectedAlready = await readJson<{ id?: unknown; status?: unknown }>(rejectedPath(space, id));
-              if (rejectedAlready?.id === id && rejectedAlready.status === "rejected") throw new Error(`Candidate already rejected in current Space: ${id}`);
-              throw new Error(`Candidate not found in current Space: ${id}`);
+          const ids = tokens.slice(1).map((id) => id.replace(/\.json$/, ""));
+          for (const id of ids) {
+            if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`Candidate id contains invalid path characters: ${id}`);
+          }
+          const outcomes: string[] = [];
+          for (const id of ids) {
+            const source = candidatePath(space, id);
+            try {
+              await enqueueSpaceWrite(space.path, async () => {
+                const candidate = await readJson<MemoryCandidate>(source);
+                const acceptedAlready = await readJson<{ id?: unknown; status?: unknown }>(memoryPath(space, id));
+                if (!candidateBelongsToSpace(candidate, space.id) || candidate.id !== id) {
+                  if (acceptedAlready?.id === id && acceptedAlready.status === "accepted") return;
+                  const rejectedAlready = await readJson<{ id?: unknown; status?: unknown }>(rejectedPath(space, id));
+                  if (rejectedAlready?.id === id && rejectedAlready.status === "rejected") throw new Error(`Candidate already rejected in current Space: ${id}`);
+                  throw new Error(`Candidate not found in current Space: ${id}`);
+                }
+                const accepted = { ...candidate, status: "accepted" as const };
+                await atomicWrite(memoryPath(space, id), JSON.stringify(accepted, null, 2) + "\n");
+                await fs.unlink(source).catch((error: NodeJS.ErrnoException) => {
+                  if (error.code !== "ENOENT") throw error;
+                });
+              });
+              outcomes.push(id);
+            } catch (error) {
+              outcomes.push(`${id} failed: ${error instanceof Error ? error.message : String(error)}`);
             }
-            const accepted = { ...candidate, status: "accepted" as const };
-            await atomicWrite(memoryPath(space, id), JSON.stringify(accepted, null, 2) + "\n");
-            await fs.unlink(source).catch((error: NodeJS.ErrnoException) => {
-              if (error.code !== "ENOENT") throw error;
-            });
-          });
-          notify(ctx, `Pi Live Memory: accepted ${id}`, "info");
+          }
+          const acceptedIds = outcomes.filter((outcome) => !outcome.includes("failed:"));
+          const failures = outcomes.filter((outcome) => outcome.includes("failed:"));
+          if (failures.length === 0) {
+            notify(ctx, `Pi Live Memory: accepted ${acceptedIds.length}: ${acceptedIds.join(", ")}`, "info");
+          } else {
+            notify(ctx, `Pi Live Memory: accepted ${acceptedIds.length} (${acceptedIds.join(", ") || "none"}); ${failures.join("; ")}`, acceptedIds.length > 0 ? "info" : "error");
+          }
           return;
         }
         if (action === "reject") {

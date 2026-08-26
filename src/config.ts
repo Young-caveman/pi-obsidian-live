@@ -4,6 +4,8 @@ import { join, resolve } from "node:path";
 
 export type MemoryMode = "off" | "read" | "read-write";
 export type RetrievalMode = "auto" | "lexical" | "hybrid";
+/** Where embedding vectors come from: local Transformers.js weights or the OpenRouter embeddings API. */
+export type EmbeddingProviderKind = "local" | "openrouter";
 
 export interface PiLiveConfig {
   dataRoot?: string;
@@ -17,16 +19,28 @@ export interface PiLiveConfig {
     jobLeaseMs?: number;
     maxJobAttempts?: number;
     shutdownTimeoutMs?: number;
+    /** Candidates with confidence >= this value skip the inbox and are accepted directly. */
+    autoAcceptMinConfidence?: number;
     retrieval?: {
       mode?: RetrievalMode;
       model?: string;
       rrfK?: number;
+      provider?: EmbeddingProviderKind;
+      /** Machine-local alternative to OPENROUTER_API_KEY; prefer the environment variable. */
+      apiKey?: string;
     };
   };
 }
 
 export const DEFAULT_DATA_ROOT = "~/.pi/agent/pi-live-data";
 export const PI_LIVE_CONFIG_NAME = "pi-live.json";
+export const DEFAULT_EMBEDDING_MODEL = "onnx-community/all-MiniLM-L6-v2-ONNX";
+export const DEFAULT_OPENROUTER_EMBEDDING_MODEL = "openai/text-embedding-3-small";
+export const OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY";
+
+function isEmbeddingProviderKind(value: unknown): value is EmbeddingProviderKind {
+  return value === "local" || value === "openrouter";
+}
 
 export function resolvePath(input: string): string {
   if (input === "~") return homedir();
@@ -78,6 +92,9 @@ export function parsePiLiveConfig(raw: string): PiLiveConfig {
     if (typeof memory.shutdownTimeoutMs === "number" && Number.isInteger(memory.shutdownTimeoutMs) && memory.shutdownTimeoutMs >= 100) {
       parsed.shutdownTimeoutMs = Math.min(memory.shutdownTimeoutMs, 10000);
     }
+    if (typeof memory.autoAcceptMinConfidence === "number" && Number.isFinite(memory.autoAcceptMinConfidence) && memory.autoAcceptMinConfidence >= 0 && memory.autoAcceptMinConfidence <= 1) {
+      parsed.autoAcceptMinConfidence = memory.autoAcceptMinConfidence;
+    }
     if (memory.retrieval && typeof memory.retrieval === "object") {
       const retrieval = memory.retrieval as Record<string, unknown>;
       const parsedRetrieval: NonNullable<PiLiveConfig["memory"]>["retrieval"] = {};
@@ -87,6 +104,10 @@ export function parsePiLiveConfig(raw: string): PiLiveConfig {
       }
       if (typeof retrieval.rrfK === "number" && Number.isInteger(retrieval.rrfK) && retrieval.rrfK >= 1) {
         parsedRetrieval.rrfK = Math.min(retrieval.rrfK, 200);
+      }
+      if (isEmbeddingProviderKind(retrieval.provider)) parsedRetrieval.provider = retrieval.provider;
+      if (typeof retrieval.apiKey === "string" && retrieval.apiKey.trim()) {
+        parsedRetrieval.apiKey = retrieval.apiKey.trim();
       }
       parsed.retrieval = parsedRetrieval;
     }
@@ -125,8 +146,40 @@ export function effectiveRetrievalMode(config: PiLiveConfig, env: NodeJS.Process
   return config.memory?.retrieval?.mode ?? "auto";
 }
 
-export const DEFAULT_EMBEDDING_MODEL = "onnx-community/all-MiniLM-L6-v2-ONNX";
+export function effectiveEmbeddingProviderKind(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): EmbeddingProviderKind {
+  const raw = env.PILIVE_EMBEDDING_PROVIDER?.trim().toLowerCase();
+  if (raw === "openrouter" || raw === "local") return raw;
+  return config.memory?.retrieval?.provider ?? "local";
+}
+
+/** The embedding model only if the operator explicitly chose one (env wins over config). */
+export function effectiveOptionalEmbeddingModel(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env.PILIVE_EMBEDDING_MODEL?.trim() || config.memory?.retrieval?.model?.trim() || undefined;
+}
 
 export function effectiveEmbeddingModel(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): string {
-  return env.PILIVE_EMBEDDING_MODEL?.trim() || config.memory?.retrieval?.model || DEFAULT_EMBEDDING_MODEL;
+  return effectiveOptionalEmbeddingModel(config, env) ?? DEFAULT_EMBEDDING_MODEL;
+}
+
+/** The model id actually used for retrieval, resolved per provider kind. */
+export function embeddingModelLabel(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = effectiveOptionalEmbeddingModel(config, env);
+  return effectiveEmbeddingProviderKind(config, env) === "openrouter"
+    ? explicit ?? DEFAULT_OPENROUTER_EMBEDDING_MODEL
+    : explicit ?? DEFAULT_EMBEDDING_MODEL;
+}
+
+/** OpenRouter credential: OPENROUTER_API_KEY first, then the machine-local config file. */
+export function effectiveEmbeddingApiKey(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env[OPENROUTER_API_KEY_ENV]?.trim() || config.memory?.retrieval?.apiKey?.trim() || undefined;
+}
+
+/** Automatic-accept threshold (0..1); unset means every candidate needs explicit `/memory accept`. */
+export function effectiveAutoAcceptMinConfidence(config: PiLiveConfig, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env.PILIVE_AUTO_ACCEPT_MIN_CONFIDENCE?.trim();
+  if (raw) {
+    const value = Number(raw);
+    if (Number.isFinite(value) && value >= 0 && value <= 1) return value;
+  }
+  return config.memory?.autoAcceptMinConfidence;
 }
