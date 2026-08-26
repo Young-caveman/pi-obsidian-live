@@ -24,8 +24,14 @@ describe("Pi Live memory", () => {
   it("uses the full project path hash and produces useful review text", async () => {
     expect(projectIdFromCwd("/one/project")).not.toBe(projectIdFromCwd("/two/project"));
     expect(candidateReviewLine({ id: "mem-1", kind: "semantic", confidence: 0.8, text: "A durable memory summary for review." })).toContain("A durable memory summary");
-    expect(candidateBelongsToSpace({ id: "mem-1", status: "candidate", spaceId: "space-a", text: "x" }, "space-a")).toBe(true);
-    expect(candidateBelongsToSpace({ id: "mem-1", status: "candidate", spaceId: "space-a", text: "x" }, "space-b")).toBe(false);
+    const validCandidate = {
+      id: "mem-1", status: "candidate" as const, spaceId: "space-a", projectId: "project-a",
+      sessionId: "session-a", source: "pi-session:session-a#leaf", kind: "semantic",
+      confidence: 0.8, createdAt: "2026-01-01T00:00:00Z", text: "A durable memory",
+    };
+    expect(candidateBelongsToSpace(validCandidate, "space-a")).toBe(true);
+    expect(candidateBelongsToSpace(validCandidate, "space-b")).toBe(false);
+    expect(candidateBelongsToSpace({ ...validCandidate, confidence: 2 }, "space-a")).toBe(false);
     expect((await withTimeout(new Promise<void>(() => {}), 10)).timedOut).toBe(true);
   });
 

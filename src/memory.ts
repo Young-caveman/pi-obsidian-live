@@ -163,7 +163,17 @@ export function candidateBelongsToSpace(candidate: Partial<MemoryCandidate> | un
       candidate.spaceId === spaceId &&
       typeof candidate.id === "string" &&
       /^[A-Za-z0-9._-]+$/.test(candidate.id) &&
-      typeof candidate.text === "string",
+      typeof candidate.projectId === "string" &&
+      typeof candidate.sessionId === "string" &&
+      typeof candidate.source === "string" &&
+      typeof candidate.kind === "string" &&
+      typeof candidate.createdAt === "string" &&
+      typeof candidate.confidence === "number" &&
+      Number.isFinite(candidate.confidence) &&
+      candidate.confidence >= 0 &&
+      candidate.confidence <= 1 &&
+      typeof candidate.text === "string" &&
+      candidate.text.trim().length > 0,
   );
 }
 
@@ -372,7 +382,12 @@ function startLeaseHeartbeat(space: SpaceDefinition, job: MemoryJob, owner: stri
     void updateLeaseIfOwned(space, job, owner, leaseMs, signal).catch(() => {});
   }, intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  const stop = () => clearInterval(timer);
+  signal.addEventListener("abort", stop, { once: true });
+  return () => {
+    stop();
+    signal.removeEventListener("abort", stop);
+  };
 }
 
 function retryDelayMs(attempts: number): number {
@@ -514,6 +529,18 @@ function cancelAutoCapture(state: SessionMemoryState): void {
     clearTimeout(state.autoCaptureTimer);
     state.autoCaptureTimer = undefined;
   }
+}
+
+/**
+ * Stop scheduling and detach an in-flight processor from this session state.
+ * The processor itself observes the abort signal and exits without committing
+ * output. Detaching it lets a newly selected Space start its own queue without
+ * waiting for a provider that ignores AbortSignal.
+ */
+function cancelProcessing(state: SessionMemoryState): void {
+  state.processingAbort?.abort();
+  state.processingAbort = undefined;
+  state.processing = undefined;
 }
 
 function scheduleAutoProcessing(ctx: ExtensionContext, state: SessionMemoryState, space: SpaceDefinition): void {
@@ -699,7 +726,7 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
           const space = await getSpace(state.dataRoot, id);
           if (!space) throw new Error(`Space not found: ${id}`);
           cancelAutoCapture(state);
-          state.processingAbort?.abort();
+          cancelProcessing(state);
           await ensureSpaceDirs(space.path);
           const entry: SpaceSessionAction = { version: 1, action: "use", spaceId: id, at: now() };
           pi.appendEntry(SPACE_ENTRY_TYPE, entry);
@@ -710,7 +737,7 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
         }
         if (action === "off") {
           cancelAutoCapture(state);
-          state.processingAbort?.abort();
+          cancelProcessing(state);
           pi.appendEntry(SPACE_ENTRY_TYPE, { version: 1, action: "off", at: now() } satisfies SpaceSessionAction);
           state.activeSpaceId = null;
           notify(ctx, "Pi Live Space: OFF (this session)", "info");
@@ -745,7 +772,7 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
           const mode: MemoryMode = action === "off" ? "off" : action === "read" ? "read" : "read-write";
           if (mode !== "read-write") {
             cancelAutoCapture(state);
-            state.processingAbort?.abort();
+            cancelProcessing(state);
           }
           pi.appendEntry(MEMORY_ENTRY_TYPE, { version: 1, mode, at: now() });
           state.mode = mode;
@@ -765,6 +792,15 @@ export function registerMemoryFeatures(pi: ExtensionAPI): void {
           }
           cancelAutoCapture(state);
           await scheduleProcessing(ctx, state, result.space);
+          const finalJob = await readJob(result.space, result.job.id);
+          if (finalJob?.status === "failed" || finalJob?.status === "dead") {
+            notify(
+              ctx,
+              `Pi Live Memory: capture ${finalJob.status} for job ${result.job.id}${finalJob.lastError ? ` — ${finalJob.lastError}` : ""}. It will retry after the backoff window.`,
+              "warning",
+            );
+            return;
+          }
           notify(ctx, `Pi Live Memory: capture processed into candidate/inbox (job ${result.job.id}). Use /memory review.`, "info");
           return;
         }
