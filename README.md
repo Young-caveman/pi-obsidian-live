@@ -1,8 +1,15 @@
 # Pi Obsidian Live
 
-A tiny [Pi](https://github.com/earendil-works/pi-mono) extension that live-mirrors
-the latest N turns of the current Pi conversation into a single Markdown file, so
-Obsidian becomes your reading surface for long responses.
+A [Pi](https://github.com/earendil-works/pi-mono) package with two deliberately
+separate features:
+
+- **Live view** mirrors the latest N turns into generated Markdown for Obsidian.
+- **Memory** optionally manages isolated Learning Spaces outside the Obsidian
+  vault and recalls accepted memories in later sessions.
+
+Obsidian is the reading surface. The configurable `dataRoot` is the memory
+store. Pi session custom entries persist only the selected Space and memory
+mode for the current session.
 
 ## Inspiration
 
@@ -30,18 +37,28 @@ Obsidian renders Markdown
 - **Full model output, in order.** Thinking, tool calls, and tool results are part
   of the model's response. They are preserved in their original order and folded
   away with Obsidian-native callouts (one click to expand).
-- **A sliding window, not a duplicate database.** Only the latest N turns are
-  shown; Pi keeps the full history. Nothing is re-stored.
+- **The live view is a projection, not a note database.** Only the latest N
+  turns are shown in generated Markdown. It is safe to overwrite or clean up.
 - **Conversation content only.** System messages, internal Pi messages, and
   metadata never appear.
+- **Memory is opt-in and isolated.** Only accepted memory records from the
+  session's mounted Learning Space can be recalled. Thinking, tool calls, tool
+  results, and credential-shaped values are excluded from extraction.
 
 ## Installation
 
+Install this directory as a local Pi package:
+
 ```bash
-cp obsidian-live.ts ~/.pi/agent/extensions/obsidian-live.ts
+pi install /Users/jimmy/coding/pi-obsidian-live
 ```
 
-Then run `/reload` in Pi (or restart Pi).
+For a global install from a published package or Git repository, use the
+corresponding `npm:` or `git:` source. Then run `/reload` in Pi (or restart Pi).
+
+The old `~/.pi/agent/oblive.json` and `OBLIVE_*` configuration remain
+compatible. The package entry point is still `obsidian-live.ts`, so existing
+`/oblive` behavior is preserved.
 
 ## Commands
 
@@ -52,6 +69,19 @@ Then run `/reload` in Pi (or restart Pi).
 | `/oblive status` | Show whether live view is on, the path, and the turn count |
 | `/oblive off` | Stop writing updates (the existing file is kept) |
 | `/oblive <flag> [on\|off]` | Toggle or set a flag: `repair`, `thinking`, `tools`, `template`. No value flips the current state. |
+| `/space list` | List registered Learning Spaces |
+| `/space new <name> [path]` | Create a Space under `dataRoot`, or at an explicit path |
+| `/space use <name>` | Mount one Space in this Pi session |
+| `/space off` | Unmount the Space in this Pi session |
+| `/space status` | Show the session's mounted Space and data root |
+| `/memory status` | Show memory mode, mounted Space, pending jobs, and backend |
+| `/memory off` | Disable recall and generation for this session |
+| `/memory read` | Enable recall without generation |
+| `/memory on` | Enable recall and candidate generation (`read-write`) |
+| `/memory capture` | Queue and process the current visible turn as candidates |
+| `/memory review` | List candidate files waiting in the Space inbox |
+| `/memory accept <id>` | Promote one candidate to accepted memory |
+| `/memory reject <id> [reason]` | Move one candidate to the Space rejected archive |
 
 Accepted boolean values for the toggle: `on`, `off`, `true`, `false`, `1`, `0` (case-insensitive). If the first token of the argument matches a flag name but the value is invalid, the command notifies an error rather than silently treating it as a path.
 
@@ -128,6 +158,79 @@ OBLIVE_PATH=~/vault/backend.md pi            # one-off exact file
 OBLIVE_OFF=1 pi                              # one-off disable
 OBLIVE_TURNS=3 pi                            # one-off window size
 ```
+
+## Learning Spaces and memory configuration
+
+Memory is independent from `/oblive`. Turning memory off does not stop the
+Obsidian live view. Add an optional `~/.pi/agent/pi-live.json`:
+
+```json
+{
+  "dataRoot": "~/.pi/agent/pi-live-data",
+  "memory": {
+    "mode": "off",
+    "autoCapture": true,
+    "captureIdleMs": 120000,
+    "minTextChars": 80,
+    "retrievalLimit": 5,
+    "maxPromptChars": 6000,
+    "jobLeaseMs": 90000,
+    "maxJobAttempts": 3,
+    "shutdownTimeoutMs": 1500
+  }
+}
+```
+
+`PILIVE_DATA_ROOT` and `PILIVE_MEMORY_MODE` (`off`, `read`, `read-write`, or
+`on`) are optional launch-time overrides. The default data root is:
+
+```text
+~/.pi/agent/pi-live-data/
+├── registry.json
+└── spaces/<space-id>/
+    ├── inbox/       # generated candidates, not recalled by default
+    ├── rejected/    # explicitly rejected candidates with provenance
+    ├── memories/    # accepted memory records used for recall
+    ├── jobs/        # durable extraction queue and retry state
+    └── index/       # derived retrieval metadata
+```
+
+`/space new <name>` creates a Space at `dataRoot/spaces/<id>`. Space names keep
+Unicode letters such as Chinese readable while removing path separators and
+other unsafe characters. Supplying a path uses that location instead, which is
+useful for placing memory data in a private directory separate from an
+Obsidian vault. Space paths are registered in `registry.json`; the selected
+Space itself is stored in the active Pi session branch with `appendEntry`, not
+in a process-global variable.
+
+There is no automatic user-note feature. Generated live views remain in the
+configured Obsidian `liveDir`/`livePath`; the package never creates ordinary
+Obsidian notes.
+
+### Memory lifecycle
+
+```text
+agent_settled
+    ↓ visible user + assistant text only
+durable job in Space/jobs
+    ↓ conservative idle/debounce window (default 2 minutes)
+ctx.modelRegistry.complete() (no sub-agent or extra Pi session)
+candidate in Space/inbox
+    ↓ /memory accept <id>
+accepted record in Space/memories
+    ↓ next before_agent_start
+bounded lexical recall for the mounted Space only
+```
+
+Automatic extraction can be disabled with `autoCapture: false`; `/memory capture`
+still runs immediately. Jobs use an expiring cross-process lease,
+heartbeat renewal, exponential retry delay, and a maximum attempt count.
+Shutdown aborts the request and waits only for the configured bounded timeout;
+an unfinished lease is recovered later as stale. Candidates are never injected
+into context until explicitly accepted. V1 intentionally implements only a
+deterministic local lexical backend behind a retrieval interface. Hybrid/vector
+retrieval (including LanceDB) is not implemented yet and is not required for
+the current fallback.
 
 ## File format
 
@@ -227,7 +330,11 @@ per launch, or `/oblive repair off` at runtime.
 | Streaming | `message_start` / `message_update` / `message_end`; the in-progress assistant message is rebuilt from its `text` / `thinking` / `toolCall` content blocks in order |
 | History | `ctx.sessionManager.getBranch()` walks the active branch only (root → leaf), so abandoned sibling branches never leak in |
 | Writes | ~300 ms debounce while streaming, then an atomic temp-file + rename (Obsidian never reads a half-written file) |
-| State | In-memory only; after `/reload`, `/new`, or a restart the extension re-enables from the config file |
+| Live state | In-memory and session-local; after `/reload`, `/new`, or a restart the live view re-enables from the existing `oblive.json` configuration |
+| Space state | Session custom entries on the active branch; `/space use` and `/space off` survive resume/fork/tree navigation correctly |
+| Memory state | JSON records and durable jobs under the configured data root; accepted records are the only recall source |
+| Background work | Idle/debounce scheduling, expiring leases, bounded retries, abortable model requests, and bounded shutdown wait |
+| Retrieval | Deterministic lexical backend behind an extension point; hybrid/vector retrieval is explicitly not implemented in V1 |
 
 ## License
 

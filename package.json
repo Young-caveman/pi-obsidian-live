@@ -1,0 +1,34 @@
+{
+  "name": "pi-obsidian-live",
+  "version": "1.0.0",
+  "description": "Pi package for live Obsidian views and optional isolated Learning Space memory",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "obsidian", "learning", "memory"],
+  "pi": {
+    "extensions": ["./obsidian-live.ts"]
+  },
+  "files": [
+    "obsidian-live.ts",
+    "src",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  }
+}

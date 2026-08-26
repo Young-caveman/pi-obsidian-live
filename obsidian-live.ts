@@ -1,8 +1,9 @@
 /**
  * Pi Obsidian Live
  *
- * A minimal reading-surface extension: mirrors the latest N turns of the
- * current Pi conversation into a single Markdown file that Obsidian renders.
+ * Pi Obsidian Live package entry point. The live-view portion mirrors the
+ * latest N turns of the current Pi conversation into generated Markdown that
+ * Obsidian renders. Optional Space/Memory features are registered separately.
  *
  * Commands:
  *   /oblive <path>                                  Enable live view (default: latest 1 turn)
@@ -75,9 +76,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { registerMemoryFeatures } from "./src/memory.js";
 
 // ---------------------------------------------------------------------------
-// In-memory configuration (V1: no persistence, no session metadata entries)
+// Live-view configuration. The live projection intentionally remains
+// session-local; Space and Memory persistence lives in src/memory.ts.
 // ---------------------------------------------------------------------------
 
 let enabled = false;
@@ -641,6 +644,10 @@ function repairMarkdown(text: string): string {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  // Memory/Space are deliberately registered independently from Live. When
+  // memory is off, this leaves the existing Obsidian projection untouched.
+  registerMemoryFeatures(pi);
+
   // --- auto-enable (ON by default; multi-agent friendly) ------------------
   // Target resolution: OBLIVE_PATH > OBLIVE_DIR (env) > config livePath /
   // liveDir (~/.pi/agent/oblive.json) > DEFAULT_LIVE_DIR. OBLIVE_OFF=1 or
