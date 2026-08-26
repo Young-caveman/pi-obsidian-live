@@ -217,7 +217,10 @@ other unsafe characters. Supplying a path uses that location instead, which is
 useful for placing memory data in a private directory separate from an
 Obsidian vault. Space paths are registered in `registry.json`; the selected
 Space itself is stored in the active Pi session branch with `appendEntry`, not
-in a process-global variable.
+in a process-global variable. Custom paths are canonicalized through their
+existing real parent, reject symlink aliases, and cannot be the same as—or a
+parent/child of—another registered Space. If the registry is malformed, Pi
+Live quarantines it with a timestamped backup and reports the backup path.
 
 There is no automatic user-note feature. Generated live views remain in the
 configured Obsidian `liveDir`/`livePath`; the package never creates ordinary
@@ -244,6 +247,12 @@ heartbeat renewal, exponential retry delay, and a maximum attempt count.
 Shutdown aborts the request and waits only for the configured bounded timeout;
 an unfinished lease is recovered later as stale. Candidates are never injected
 into context until explicitly accepted.
+
+Recall is inserted as escaped structured records with project/session/source
+provenance. The surrounding prompt marks these records as untrusted reference
+data and explicitly excludes commands, policy, permissions, or other embedded
+instructions. Invalid queue JSON/schema records are moved to the Space's
+`jobs/quarantine/` directory so one damaged job cannot block the queue.
 
 ### Hybrid retrieval
 

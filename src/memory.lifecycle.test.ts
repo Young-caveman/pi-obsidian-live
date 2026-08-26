@@ -187,6 +187,75 @@ describe("Memory lifecycle", () => {
     expect(runtime.notifications.at(-1)).toContain("Candidate not found in current Space");
   });
 
+  it("serializes concurrent accept/reject mutations and makes repeats idempotent", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "pi-live-memory-mutations-"));
+    cleanup.push(root);
+    process.env.PILIVE_DATA_ROOT = root;
+    process.env.PILIVE_MEMORY_MODE = "read-write";
+    const space = await createSpace(root, "mutations");
+    const left = makeRuntime(root, space.id, async () => ({ content: [{ type: "text", text: "[]" }] }));
+    const right = makeRuntime(root, space.id, async () => ({ content: [{ type: "text", text: "[]" }] }));
+
+    const accepted = candidate(space, "mem-concurrent", "Concurrent acceptance must leave one consistent accepted record.");
+    await atomicWrite(join(space.path, "inbox", `${accepted.id}.json`), JSON.stringify(accepted));
+    await Promise.all([
+      left.commands.get("memory")!.handler("accept mem-concurrent", left.ctx),
+      right.commands.get("memory")!.handler("accept mem-concurrent", right.ctx),
+    ]);
+    expect((await readJson<{ status: string }>(join(space.path, "memories", "mem-concurrent.json"))).status).toBe("accepted");
+    expect((await fs.readdir(join(space.path, "inbox")))).not.toContain("mem-concurrent.json");
+
+    const rejected = candidate(space, "mem-conflict", "A concurrent accept and reject must resolve to one durable state.");
+    await atomicWrite(join(space.path, "inbox", `${rejected.id}.json`), JSON.stringify(rejected));
+    await Promise.all([
+      left.commands.get("memory")!.handler("accept mem-conflict", left.ctx),
+      right.commands.get("memory")!.handler("reject mem-conflict race", right.ctx),
+    ]);
+    const hasAccepted = await fs.stat(join(space.path, "memories", "mem-conflict.json")).then(() => true).catch(() => false);
+    const hasRejected = await fs.stat(join(space.path, "rejected", "mem-conflict.json")).then(() => true).catch(() => false);
+    expect(Number(hasAccepted) + Number(hasRejected)).toBe(1);
+    expect((await fs.readdir(join(space.path, "inbox")))).not.toContain("mem-conflict.json");
+  });
+
+  it("rebuilds mounted Space and mode after session tree navigation", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "pi-live-memory-tree-"));
+    cleanup.push(root);
+    process.env.PILIVE_DATA_ROOT = root;
+    process.env.PILIVE_MEMORY_MODE = "off";
+    const first = await createSpace(root, "first");
+    const second = await createSpace(root, "second");
+    await atomicWrite(join(first.path, "memories", "first.json"), JSON.stringify({
+      id: "first", status: "accepted", spaceId: first.id, projectId: "project-a", sessionId: "session-a", source: "first", kind: "semantic", confidence: 0.9, createdAt: "2026-01-01T00:00:00Z", text: "branch unique first memory",
+    }));
+    await atomicWrite(join(second.path, "memories", "second.json"), JSON.stringify({
+      id: "second", status: "accepted", spaceId: second.id, projectId: "project-b", sessionId: "session-b", source: "second", kind: "semantic", confidence: 0.9, createdAt: "2026-01-01T00:00:00Z", text: "branch unique second memory",
+    }));
+    const runtime = makeRuntime(root, first.id, async () => ({ content: [{ type: "text", text: "[]" }] }));
+    await emit(runtime, "session_start");
+    runtime.branch.splice(0, runtime.branch.length,
+      { type: "custom", customType: "pi-live-space", data: { version: 1, action: "use", spaceId: second.id } },
+      { type: "custom", customType: "pi-live-memory", data: { version: 1, mode: "read" } },
+    );
+    await emit(runtime, "session_tree", { newLeafId: "branch-b", oldLeafId: "branch-a" });
+    const result = await emit(runtime, "before_agent_start", { prompt: "second memory", systemPrompt: "base" }) as { systemPrompt?: string } | undefined;
+    expect(result?.systemPrompt).toContain("project-b");
+    expect(result?.systemPrompt).not.toContain("project-a");
+  });
+
+  it("quarantines malformed queue records without blocking status", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "pi-live-memory-job-schema-"));
+    cleanup.push(root);
+    process.env.PILIVE_DATA_ROOT = root;
+    process.env.PILIVE_MEMORY_MODE = "read-write";
+    const space = await createSpace(root, "job schema");
+    await fs.writeFile(join(space.path, "jobs", "job-corrupt.json"), JSON.stringify({ id: "job-corrupt", status: "queued", attempts: "not-a-number" }), "utf8");
+    const runtime = makeRuntime(root, space.id, async () => ({ content: [{ type: "text", text: "[]" }] }));
+    await emit(runtime, "session_start");
+    await runtime.commands.get("memory")!.handler("status", runtime.ctx);
+    expect(runtime.notifications.some((message) => message.includes("quarantined invalid job"))).toBe(true);
+    expect((await fs.readdir(join(space.path, "jobs", "quarantine"))).some((name) => name.startsWith("job-corrupt.json.corrupt-"))).toBe(true);
+  });
+
   it("reports a failed manual capture and recovers the durable job later", async () => {
     const root = await fs.mkdtemp(join(tmpdir(), "pi-live-memory-recovery-"));
     cleanup.push(root);
@@ -249,6 +318,7 @@ describe("Memory lifecycle", () => {
     await expect(emit(runtime, "session_start")).resolves.toBeUndefined();
     await expect(emit(runtime, "before_agent_start", { prompt: "recall" })).resolves.toBeUndefined();
     await runtime.commands.get("memory")!.handler("status", runtime.ctx);
-    expect(runtime.notifications.at(-1)).toContain("Pi Live /memory");
+    expect(runtime.notifications.some((message) => message.includes("registry was corrupt and was quarantined"))).toBe(true);
+    expect(runtime.notifications.at(-1)).toContain("Pi Live Memory");
   });
 });
